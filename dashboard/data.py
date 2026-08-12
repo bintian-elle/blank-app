@@ -16,6 +16,12 @@ COMPARISON_METRICS = METRIC_NAMES
 REPORT_STATS = ["recipients", "delivered", "open_rate", "click_rate", "conversion_value", "conversions", "average_order_value", "unsubscribe_rate", "bounce_rate", "spam_complaint_rate"]
 
 
+@st.cache_resource
+def shared_yoy_store() -> dict[tuple[str, str], dict]:
+    """Process-wide YoY results shared by all browser sessions."""
+    return {}
+
+
 def _total(values: dict[str, list[float]], measurement: str) -> float:
     return sum(values.get(measurement, []))
 

@@ -10,7 +10,7 @@ import streamlit as st
 from dashboard.charts import line_chart
 from dashboard.components import ab_test_card, activity_card, change, comparison_label, date_filters, detail_cards, fmt_money, fmt_num, insight_card, module_performance_table, percent_change_text, section, top_creative_table
 from dashboard.config import API_KEY, EMAIL_SUBSCRIBER_SEGMENT_ID, REVISION, SMS_SUBSCRIBER_SEGMENT_ID
-from dashboard.data import ab_test_frame, aggregate, creative_module_frame, load_channel_revenue, load_creative_clicks, load_dashboard, load_subscriber_inventory, report_frame, report_totals
+from dashboard.data import ab_test_frame, aggregate, creative_module_frame, load_channel_revenue, load_creative_clicks, load_dashboard, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
 from dashboard.styles import apply_styles
 from klaviyo_client import KlaviyoError
 
@@ -72,6 +72,12 @@ yoy_window_key = (yoy_start.isoformat(), yoy_end.isoformat())
 stored_yoy = st.session_state.get("dashboard_yoy_data")
 if stored_yoy and stored_yoy.get("window") == yoy_window_key:
     yoy_revenue = stored_yoy.get("revenue")
+shared_yoy = shared_yoy_store()
+shared_entry = shared_yoy.get(yoy_window_key)
+if shared_entry and time.time() - float(shared_entry.get("loaded_at", 0)) < 7200:
+    yoy_revenue = shared_entry.get("revenue")
+elif shared_entry:
+    shared_yoy.pop(yoy_window_key, None)
 
 
 def yoy_change(current_value: float, channel: str) -> tuple[str, str]:
@@ -140,6 +146,7 @@ if request_yoy:
             activity_metric_ids = tuple(current["metric_ids"].get(name, "") for name in ("Subscribed to Email Marketing", "Subscribed to Text Messaging Marketing", "Unsubscribed from Email Marketing", "Unsubscribed from Text Messaging Marketing"))
             yoy_revenue = load_channel_revenue(API_KEY, REVISION, yoy_start, yoy_end, current["metric_ids"]["Placed Order"], current["metric_ids"].get("Received Email", ""), current["metric_ids"].get("Sent Text Message", ""), activity_metric_ids)
         st.session_state["dashboard_yoy_data"] = {"window": yoy_window_key, "revenue": yoy_revenue}
+        shared_yoy[yoy_window_key] = {"loaded_at": time.time(), "revenue": yoy_revenue}
     except KlaviyoError as exc:
         yoy_status = "--%"
         error_text = str(exc)
@@ -349,5 +356,8 @@ else:
 
 st.write("")
 if st.button("↻ Refresh Klaviyo data"):
-    st.cache_data.clear(); st.rerun()
+    shared_yoy_store().clear()
+    st.session_state.pop("dashboard_yoy_data", None)
+    st.cache_data.clear()
+    st.rerun()
 st.markdown(f'<div class="page-note">Data covers {start:%Y-%m-%d} to {end:%Y-%m-%d} from Klaviyo · API revision {REVISION} · Cached for 2 hours</div>', unsafe_allow_html=True)
