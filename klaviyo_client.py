@@ -210,21 +210,26 @@ class KlaviyoClient:
         results = document.get("data", {}).get("attributes", {}).get("results", [])
         return {row.get("groupings", {}).get("segment_id", ""): float(row.get("statistics", {}).get("total_members") or 0) for row in results}
 
-    def campaign_details(self, channel: str) -> tuple[dict[str, str], dict[str, str]]:
+    def campaign_details(self, channel: str) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         rows = self.get_all(
             "campaigns/",
-            params={"filter": f'equals(messages.channel,"{channel}")', "page[size]": 50},
+            params={"filter": f'equals(messages.channel,"{channel}")', "include": "campaign-messages", "page[size]": 50},
         )
         names = {row.get("id", ""): row.get("attributes", {}).get("name", "Unnamed campaign") for row in rows}
         dates = {}
+        message_ids = {}
         for row in rows:
             attributes = row.get("attributes", {})
             sent_at = attributes.get("send_time") or attributes.get("scheduled_at")
-            dates[row.get("id", "")] = str(sent_at or "")[:10]
-        return names, dates
+            campaign_id = row.get("id", "")
+            dates[campaign_id] = str(sent_at or "")[:10]
+            related_messages = row.get("relationships", {}).get("campaign-messages", {}).get("data", []) or []
+            if related_messages:
+                message_ids[campaign_id] = str(related_messages[0].get("id") or "")
+        return names, dates, message_ids
 
     def campaigns(self, channel: str) -> dict[str, str]:
-        names, _ = self.campaign_details(channel)
+        names, _, _ = self.campaign_details(channel)
         return names
 
     def template_for_campaign_message(self, message_id: str) -> dict[str, Any]:
@@ -234,7 +239,16 @@ class KlaviyoClient:
             f"campaign-messages/{message_id}/template/",
             params={"fields[template]": "name,editor_type,html,text"},
         )
-        return document.get("data", {}).get("attributes", {})
+        # Klaviyo returns JSON:API `data: null` for messages without an
+        # attached template (for example some SMS/MMS or draft messages).
+        data = document.get("data") or {}
+        return data.get("attributes") or {}
+
+    def campaign_message(self, message_id: str) -> dict[str, Any]:
+        """Return campaign-message attributes, including SMS definition/content."""
+        document = self._request("GET", f"campaign-messages/{message_id}/")
+        data = document.get("data") or {}
+        return data.get("attributes") or {}
 
     def flows(self) -> dict[str, str]:
         rows = self.get_all("flows/", params={"page[size]": 50})

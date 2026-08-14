@@ -63,9 +63,9 @@ def load_reports(api_key: str, revision: str, start: date, end: date, previous_s
         previous_window = DateWindow(previous_start, previous_end)
         previous_campaigns = client.reporting_values("campaign-values-report", previous_window, order_id, REPORT_STATS, group_campaign)
         previous_flows = client.reporting_values("flow-values-report", previous_window, order_id, REPORT_STATS, group_flow)
-    email_names, email_dates = client.campaign_details("email")
-    sms_names, sms_dates = client.campaign_details("sms")
-    return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows, "campaign_names": {**email_names, **sms_names}, "campaign_dates": {**email_dates, **sms_dates}, "flow_names": client.flows()}
+    email_names, email_dates, email_message_ids = client.campaign_details("email")
+    sms_names, sms_dates, sms_message_ids = client.campaign_details("sms")
+    return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows, "campaign_names": {**email_names, **sms_names}, "campaign_dates": {**email_dates, **sms_dates}, "campaign_message_ids": {**email_message_ids, **sms_message_ids}, "flow_names": client.flows()}
 
 
 @st.cache_data(ttl=7200, show_spinner=False)
@@ -123,8 +123,16 @@ class _LinkedAssetParser(HTMLParser):
         values = dict(attrs)
         if tag == "a":
             self.current_href = values.get("href") or ""
-        elif tag == "img" and self.current_href:
-            self.links.append({"url": self.current_href, "image_url": values.get("src") or "", "label": values.get("alt") or "Linked image"})
+        elif tag == "img":
+            self.links.append(
+                {
+                    "url": self.current_href,
+                    "image_url": values.get("src") or "",
+                    "label": values.get("alt") or "Campaign image",
+                    "width": values.get("width") or "",
+                    "height": values.get("height") or "",
+                }
+            )
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "a":
@@ -139,19 +147,83 @@ def _clean_url(value: str) -> str:
         return value.strip()
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+def _image_dimension(value: str) -> int:
+    digits = "".join(character for character in str(value) if character.isdigit())
+    return int(digits) if digits else 0
+
+
+def _asset_score(asset: dict[str, str]) -> tuple[int, int]:
+    """Prefer the large editorial image over logos, spacers, and tracking pixels."""
+    image_url = asset.get("image_url", "").lower()
+    width = _image_dimension(asset.get("width", ""))
+    height = _image_dimension(asset.get("height", ""))
+    penalty = -1 if any(token in image_url for token in ("pixel", "tracking", "spacer", "logo")) else 0
+    return penalty, width * max(height, 1)
+
+
+@st.cache_resource
+def campaign_creative_store() -> dict[str, list[dict[str, str]]]:
+    """Keep immutable campaign creative metadata for the life of the app."""
+    return {}
+
+
 def load_campaign_creatives(api_key: str, revision: str, messages: tuple[tuple[str, str], ...]) -> dict[str, list[dict[str, str]]]:
     client = KlaviyoClient(api_key, revision)
+    cached_assets = campaign_creative_store()
     result: dict[str, list[dict[str, str]]] = {}
-    for message_name, message_id in messages[:5]:
+    for message_name, message_id in messages:
+        if message_id in cached_assets:
+            result[message_name] = cached_assets[message_id]
+            continue
         try:
             template = client.template_for_campaign_message(message_id)
             parser = _LinkedAssetParser()
             parser.feed(str(template.get("html") or ""))
-            result[message_name] = parser.links
-        except KlaviyoError:
+            assets = sorted(
+                (asset for asset in parser.links if asset.get("image_url", "").startswith(("http://", "https://"))),
+                key=_asset_score,
+                reverse=True,
+            )
+            cached_assets[message_id] = assets
+            result[message_name] = assets
+        except (KlaviyoError, AttributeError, TypeError, ValueError):
+            # Do not cache transient API errors; the next rerun can try again.
             result[message_name] = []
-        time.sleep(.15)
+        time.sleep(.25)
+    return result
+
+
+@st.cache_resource
+def sms_preview_store() -> dict[str, dict[str, object]]:
+    """Keep sent SMS content indefinitely for the life of the app process."""
+    return {}
+
+
+def load_sms_previews(api_key: str, revision: str, messages: tuple[tuple[str, str], ...]) -> dict[str, dict[str, object]]:
+    client = KlaviyoClient(api_key, revision)
+    cached_previews = sms_preview_store()
+    result: dict[str, dict[str, object]] = {}
+    for campaign_name, message_id in messages:
+        if message_id in cached_previews:
+            result[campaign_name] = cached_previews[message_id]
+            continue
+        try:
+            attributes = client.campaign_message(message_id)
+            definition = attributes.get("definition") or {}
+            content = definition.get("content") or {}
+            render_options = definition.get("render_options") or {}
+            preview: dict[str, object] = {
+                "body": str(content.get("body") or ""),
+                "media_url": str(content.get("media_url") or ""),
+                "add_org_prefix": bool(render_options.get("add_org_prefix")),
+                "add_opt_out_language": bool(render_options.get("add_opt_out_language")),
+            }
+            cached_previews[message_id] = preview
+            result[campaign_name] = preview
+        except (KlaviyoError, AttributeError, TypeError, ValueError):
+            # Retry transient failures on the next rerun.
+            result[campaign_name] = {}
+        time.sleep(.25)
     return result
 
 
@@ -187,7 +259,7 @@ def report_totals(rows: list[dict], channel: str | None = None) -> dict[str, flo
     return {**sums, **weighted, "average_order_value": sums["conversion_value"] / sums["conversions"] if sums["conversions"] else 0}
 
 
-def report_frame(rows: list[dict], names: dict[str, str], id_field: str, channel: str | None = None, limit: int = 50, dates: dict[str, str] | None = None) -> pd.DataFrame:
+def report_frame(rows: list[dict], names: dict[str, str], id_field: str, channel: str | None = None, limit: int | None = 50, dates: dict[str, str] | None = None) -> pd.DataFrame:
     grouped: dict[str, dict[str, float]] = {}
     for row in rows:
         group = row.get("groupings", {})
@@ -210,7 +282,7 @@ def report_frame(rows: list[dict], names: dict[str, str], id_field: str, channel
         frame = frame.sort_values(["_sent_at", "Revenue"], ascending=[False, False], na_position="last").drop(columns="_sent_at")
     else:
         frame = frame.sort_values("Revenue", ascending=False)
-    return frame.head(limit)
+    return frame if limit is None else frame.head(limit)
 
 
 TABLE_FORMATS = {"Revenue": "${:,.2f}", "Open rate": "{:.2%}", "Click rate": "{:.2%}", "AOV": "${:,.2f}"}

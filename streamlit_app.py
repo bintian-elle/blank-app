@@ -8,9 +8,9 @@ import pandas as pd
 import streamlit as st
 
 from dashboard.charts import line_chart
-from dashboard.components import ab_test_card, activity_card, change, comparison_label, date_filters, detail_cards, fmt_money, fmt_num, insight_card, module_performance_table, percent_change_text, section, top_creative_table
+from dashboard.components import ab_test_card, activity_card, change, comparison_label, date_filters, detail_cards, fmt_money, fmt_num, insight_card, module_performance_table, percent_change_text, section, sms_campaign_cards, top_creative_table
 from dashboard.config import API_KEY, EMAIL_SUBSCRIBER_SEGMENT_ID, REVISION, SMS_SUBSCRIBER_SEGMENT_ID
-from dashboard.data import ab_test_frame, aggregate, creative_module_frame, load_channel_revenue, load_creative_clicks, load_dashboard, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
+from dashboard.data import ab_test_frame, aggregate, creative_module_frame, load_campaign_creatives, load_channel_revenue, load_creative_clicks, load_dashboard, load_sms_previews, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
 from dashboard.styles import apply_styles
 from klaviyo_client import KlaviyoError
 
@@ -246,8 +246,37 @@ with sms_activity[2]:
 flow_df = report_frame(reports["flows"], reports["flow_names"], "flow_id", limit=10)
 previous_flow_df = report_frame(reports["previous_flows"], reports["flow_names"], "flow_id", limit=100)
 yoy_flow_df = report_frame(yoy_revenue.get("flows", []), reports["flow_names"], "flow_id", limit=100) if yoy_revenue else pd.DataFrame(columns=flow_df.columns)
-email_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "email", 10, reports.get("campaign_dates", {}))
-sms_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "sms", 10, reports.get("campaign_dates", {}))
+email_campaign_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "email", None, reports.get("campaign_dates", {}))
+sms_campaign_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "sms", None, reports.get("campaign_dates", {}))
+
+
+def paginated_campaigns(frame: pd.DataFrame, channel: str) -> tuple[pd.DataFrame, int, int]:
+    """Keep campaign pagination local to each browser session and date window."""
+    window_key = (start.isoformat(), end.isoformat())
+    stored_window_key = f"dashboard_{channel}_campaign_window"
+    count_key = f"dashboard_{channel}_campaign_count"
+    if st.session_state.get(stored_window_key) != window_key:
+        st.session_state[stored_window_key] = window_key
+        st.session_state[count_key] = 20
+    visible_count = min(int(st.session_state.get(count_key, 20)), len(frame))
+    return frame.head(visible_count), visible_count, len(frame)
+
+
+def campaign_load_more(channel: str, visible_count: int, total_count: int) -> None:
+    label = f"Showing {visible_count} of {total_count} campaigns"
+    info_column, button_column = st.columns([5, 1.25], vertical_alignment="center")
+    with info_column:
+        st.caption(label)
+    if visible_count < total_count:
+        with button_column:
+            if st.button("Load 20 more", key=f"{channel}_campaign_load_more", use_container_width=True):
+                count_key = f"dashboard_{channel}_campaign_count"
+                st.session_state[count_key] = min(visible_count + 20, total_count)
+                st.rerun()
+
+
+email_df, email_visible_count, email_campaign_count = paginated_campaigns(email_campaign_df, "email")
+sms_df, sms_visible_count, sms_campaign_count = paginated_campaigns(sms_campaign_df, "sms")
 
 
 def select_flow(label: str, aliases: tuple[str, ...]) -> dict:
@@ -264,7 +293,7 @@ featured_flows = [select_flow("Welcome Flow", ("welcome",)), select_flow("SMS We
 featured_flow_df = pd.DataFrame(featured_flows)
 
 
-def cards_from_frame(frame: pd.DataFrame, title_field: str, specs: list[tuple[str, str, object, bool]]) -> list[tuple[str, list[tuple[str, str, str]]]]:
+def cards_from_frame(frame: pd.DataFrame, title_field: str, specs: list[tuple[str, str, object, bool]], images: dict[str, str] | None = None) -> list[tuple]:
     cards = []
     for _, row in frame.iterrows():
         metrics = []
@@ -275,8 +304,36 @@ def cards_from_frame(frame: pd.DataFrame, title_field: str, specs: list[tuple[st
             if color_change and pd.notna(raw):
                 css = "positive" if float(raw) >= 0 else "negative"
             metrics.append((label, value, css))
-        cards.append((str(row.get(title_field) or "Untitled"), metrics))
+        title = str(row.get(title_field) or "Untitled")
+        cards.append((title, metrics, (images or {}).get(title, "")))
     return cards
+
+
+def campaign_messages(frame: pd.DataFrame, channel: str) -> tuple[tuple[str, str], ...]:
+    """Return one message/template per visible campaign, preserving display order."""
+    message_by_campaign: dict[str, str] = {}
+    for report_row in reports["campaigns"]:
+        group = report_row.get("groupings", {})
+        if str(group.get("send_channel") or "").strip().lower() != channel:
+            continue
+        campaign_id = str(group.get("campaign_id") or "")
+        # A/B templates are attached to the variation. For standard campaigns,
+        # reporting can return the campaign ID in `campaign_message_id`, so use
+        # the real campaign-message relationship collected from Campaigns API.
+        message_id = str(
+            group.get("variation")
+            or reports.get("campaign_message_ids", {}).get(campaign_id)
+            or group.get("campaign_message_id")
+            or ""
+        )
+        if campaign_id and message_id and campaign_id not in message_by_campaign:
+            message_by_campaign[campaign_id] = message_id
+    campaign_id_by_name = {name: campaign_id for campaign_id, name in reports["campaign_names"].items()}
+    return tuple(
+        (str(row["Name"]), message_by_campaign[campaign_id_by_name[str(row["Name"])]])
+        for _, row in frame.iterrows()
+        if str(row["Name"]) in campaign_id_by_name and campaign_id_by_name[str(row["Name"])] in message_by_campaign
+    )
 
 
 money = lambda value: fmt_money(float(value or 0))
@@ -293,13 +350,30 @@ for row_start, row_size in ((0, 3), (3, 2)):
             insight_card(str(flow["Flow Name"]), fmt_money(float(flow["Revenue"])), percent_change_text(float(flow["Revenue"]), float(flow["Previous Revenue"])), comparison=comparison_note, secondary_delta=yoy_delta)
 
 section("5", "EMAIL CAMPAIGN PERFORMANCE")
-detail_cards(cards_from_frame(email_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Open rate", "Open Rate", rate, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)]), columns=2)
+email_messages = campaign_messages(email_df, "email")
+loading_images = {name: "__loading__" for name, _ in email_messages}
+campaign_cards = st.empty()
+with campaign_cards.container():
+    detail_cards(cards_from_frame(email_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Open rate", "Open Rate", rate, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)], loading_images), columns=2, key="email-loading")
+campaign_assets = load_campaign_creatives(API_KEY, REVISION, email_messages)
+campaign_images = {name: assets[0]["image_url"] for name, assets in campaign_assets.items() if assets}
+with campaign_cards.container():
+    detail_cards(cards_from_frame(email_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Open rate", "Open Rate", rate, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)], campaign_images), columns=2, key="email")
+campaign_load_more("email", email_visible_count, email_campaign_count)
 
 section("6", "SMS CAMPAIGN PERFORMANCE")
 if sms_df.empty:
     st.info(f"No SMS campaigns were returned by Klaviyo for {start:%b %d, %Y} – {end:%b %d, %Y}.")
 else:
-    detail_cards(cards_from_frame(sms_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)]), columns=2)
+    sms_messages = campaign_messages(sms_df, "sms")
+    sms_cards_data = cards_from_frame(sms_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)])
+    sms_cards = st.empty()
+    with sms_cards.container():
+        sms_campaign_cards(sms_cards_data, {name: {"loading": True} for name, _ in sms_messages}, columns=2, key="sms-loading")
+    sms_previews = load_sms_previews(API_KEY, REVISION, sms_messages)
+    with sms_cards.container():
+        sms_campaign_cards(sms_cards_data, sms_previews, columns=2, key="sms")
+    campaign_load_more("sms", sms_visible_count, sms_campaign_count)
 
 # 7–8 experimentation and creative detail
 section("7", "A/B TESTING")
@@ -345,14 +419,22 @@ else:
     creative_df["_sent_at"] = pd.to_datetime(creative_df["Sent Date"], errors="coerce", utc=True)
     creative_df = creative_df.sort_values(["_sent_at", "Campaign Name", "Unique clicks"], ascending=[False, True, False], na_position="last")
     creative_df["Module"] = creative_df.groupby("Campaign").cumcount().add(1).map(lambda value: f"Module {value}")
+    module_campaign_names = creative_df.drop_duplicates("Campaign").head(8)["Campaign Name"].astype(str).tolist()
+    top_creatives = creative_df.sort_values(["Module click rate", "Unique clicks"], ascending=False).head(10)
+    creative_campaign_names = list(dict.fromkeys(module_campaign_names + top_creatives["Campaign Name"].astype(str).tolist()))
+    creative_messages = campaign_messages(pd.DataFrame({"Name": creative_campaign_names}), "email")
+    missing_creative_messages = tuple((name, message_id) for name, message_id in creative_messages if name not in campaign_images)
+    if missing_creative_messages:
+        extra_campaign_assets = load_campaign_creatives(API_KEY, REVISION, missing_creative_messages)
+        campaign_images.update({name: assets[0]["image_url"] for name, assets in extra_campaign_assets.items() if assets})
     module_campaigns = []
     for _, modules in creative_df.groupby("Campaign", sort=False):
-        module_campaigns.append((str(modules.iloc[0]["Campaign Name"]), str(modules.iloc[0]["Sent Date"]), [(str(row["Module / URL"]), f'{float(row["Module click rate"]):.2%}') for _, row in modules.head(6).iterrows()]))
+        campaign_name = str(modules.iloc[0]["Campaign Name"])
+        module_campaigns.append((campaign_name, str(modules.iloc[0]["Sent Date"]), [(str(row["Module / URL"]), f'{float(row["Module click rate"]):.2%}') for _, row in modules.head(6).iterrows()], campaign_images.get(campaign_name, "")))
     st.markdown('<div class="chart-title">Module Performance (Click Rate)</div><div class="chart-subtitle">Each unique tracked URL is treated as one module</div>', unsafe_allow_html=True)
     module_performance_table(module_campaigns[:8])
     st.markdown('<div class="chart-title" style="margin-top:1rem">Top Creative</div><div class="chart-subtitle">Tracked URLs ranked by click rate</div>', unsafe_allow_html=True)
-    top_creatives = creative_df.sort_values(["Module click rate", "Unique clicks"], ascending=False).head(10)
-    top_creative_table([{"campaign": str(row["Campaign Name"]), "module": str(row["Module"]), "url": str(row["Module / URL"]), "clicks": fmt_num(float(row["Unique clicks"])), "rate": f'{float(row["Module click rate"]):.2%}'} for _, row in top_creatives.iterrows()])
+    top_creative_table([{"campaign": str(row["Campaign Name"]), "module": str(row["Module"]), "url": str(row["Module / URL"]), "clicks": fmt_num(float(row["Unique clicks"])), "rate": f'{float(row["Module click rate"]):.2%}', "image": campaign_images.get(str(row["Campaign Name"]), "")} for _, row in top_creatives.iterrows()])
 
 st.write("")
 if st.button("↻ Refresh Klaviyo data"):

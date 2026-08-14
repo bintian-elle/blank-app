@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
+import re
 
 import streamlit as st
 
@@ -70,18 +71,99 @@ def group_card(title: str, comparison: str, rows: list[tuple[str, str, tuple[str
     st.markdown(f'<div class="group-card"><div class="group-title">{icon_html}{title}</div><div class="group-head"><span>Metric</span><span>Value</span><span>{comparison}</span></div>{body}</div>', unsafe_allow_html=True)
 
 
-def detail_cards(cards: list[tuple[str, list[tuple[str, str, str]]]], columns: int = 1) -> None:
+def detail_cards(cards: list[tuple], columns: int = 1, key: str = "detail") -> None:
     """Render compact record cards while retaining every supplied metric."""
     if not cards:
         return
-    body = "".join(
-        f'<div class="detail-card"><div class="detail-title" title="{escape(str(title), quote=True)}">{escape(str(title))}</div><div class="detail-metrics">'
-        + "".join(f'<div class="detail-metric"><span>{escape(str(label))}</span><strong class="{css}">{escape(str(value))}</strong></div>' for label, value, css in metrics)
-        + "</div></div>"
-        for title, metrics in cards
-    )
+    rendered_cards = []
+    for index, card in enumerate(cards):
+        title, metrics = card[0], card[1]
+        image_url = str(card[2]) if len(card) > 2 and card[2] else ""
+        modal_id = f"{key}-campaign-preview-{index}"
+        if image_url == "__loading__":
+            thumbnail = '<div class="campaign-thumb campaign-thumb-loading"><span>Loading…</span></div>'
+            modal = ""
+        elif image_url:
+            safe_image = escape(image_url, quote=True)
+            thumbnail = (
+                f'<a class="campaign-thumb-link" href="#{modal_id}" aria-label="Open image preview for {escape(str(title), quote=True)}">'
+                f'<img class="campaign-thumb" src="{safe_image}" alt="{escape(str(title), quote=True)}"></a>'
+            )
+            modal = (
+                f'<div id="{modal_id}" class="campaign-lightbox"><a class="campaign-lightbox-backdrop" href="#{key}-campaign-previews" aria-label="Close preview"></a>'
+                f'<div class="campaign-lightbox-dialog"><a class="campaign-lightbox-close" href="#{key}-campaign-previews" aria-label="Close preview">&times;</a>'
+                f'<img src="{safe_image}" alt="{escape(str(title), quote=True)}"><div>{escape(str(title))}</div></div></div>'
+            )
+        else:
+            thumbnail = '<div class="campaign-thumb campaign-thumb-empty" aria-hidden="true">▧</div>'
+            modal = ""
+        metric_html = "".join(
+            f'<div class="detail-metric"><span>{escape(str(label))}</span><strong class="{css}">{escape(str(value))}</strong></div>'
+            for label, value, css in metrics
+        )
+        rendered_cards.append(
+            f'<div class="detail-card"><div class="detail-card-heading">{thumbnail}'
+            f'<div class="detail-title" title="{escape(str(title), quote=True)}">{escape(str(title))}</div></div>'
+            f'<div class="detail-metrics">{metric_html}</div></div>{modal}'
+        )
+    body = "".join(rendered_cards)
     css_class = " detail-card-grid" if columns == 2 else ""
-    st.markdown(f'<div class="detail-card-list{css_class}">{body}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div id="{key}-campaign-previews" class="detail-card-list{css_class}">{body}</div>', unsafe_allow_html=True)
+
+
+def _sms_body_html(preview: dict[str, object]) -> str:
+    body = str(preview.get("body") or "").strip()
+    if preview.get("add_org_prefix") and not body.lower().startswith("bluevua"):
+        body = f"Bluevua Water: {body}"
+    escaped = escape(body)
+    linked = re.sub(
+        r"(https?://[^\s<]+)",
+        lambda match: f'<a href="{escape(match.group(1), quote=True)}" target="_blank" rel="noopener">{match.group(1)}</a>',
+        escaped,
+    )
+    if preview.get("add_opt_out_language"):
+        linked += "<br><br>Reply STOP to opt-out"
+    return linked.replace("\n", "<br>")
+
+
+def sms_campaign_cards(cards: list[tuple], previews: dict[str, dict[str, object]], columns: int = 2, key: str = "sms") -> None:
+    """Render SMS metrics with a generated phone preview from Klaviyo message content."""
+    rendered_cards = []
+    for index, (title, metrics, *_rest) in enumerate(cards):
+        preview = previews.get(str(title), {})
+        modal_id = f"{key}-phone-preview-{index}"
+        if preview.get("loading"):
+            thumbnail = '<div class="campaign-thumb campaign-thumb-loading"><span>Loading…</span></div>'
+            modal = ""
+        elif preview.get("body"):
+            media_url = str(preview.get("media_url") or "")
+            media_html = f'<img class="sms-media" src="{escape(media_url, quote=True)}" alt="MMS creative">' if media_url.startswith(("http://", "https://")) else ""
+            thumbnail = (
+                f'<a class="sms-phone-thumb-link" href="#{modal_id}" aria-label="Open SMS preview for {escape(str(title), quote=True)}">'
+                '<div class="sms-phone-thumb"><i></i><span></span><span></span><span></span></div></a>'
+            )
+            modal = (
+                f'<div id="{modal_id}" class="campaign-lightbox sms-lightbox"><a class="campaign-lightbox-backdrop" href="#{key}-campaign-previews" aria-label="Close preview"></a>'
+                f'<div class="sms-preview-dialog"><a class="campaign-lightbox-close" href="#{key}-campaign-previews" aria-label="Close preview">&times;</a>'
+                '<div class="sms-phone"><div class="sms-phone-top"><i></i></div><div class="sms-contact"><b></b><span>Bluevua Water</span></div>'
+                f'<div class="sms-conversation"><div class="sms-bubble">{media_html}{_sms_body_html(preview)}</div></div>'
+                '<div class="sms-phone-bottom"><i></i><i></i><span></span></div></div>'
+                f'<div class="sms-preview-title">{escape(str(title))}</div></div></div>'
+            )
+        else:
+            thumbnail = '<div class="campaign-thumb campaign-thumb-empty" aria-hidden="true">▧</div>'
+            modal = ""
+        metric_html = "".join(
+            f'<div class="detail-metric"><span>{escape(str(label))}</span><strong class="{css}">{escape(str(value))}</strong></div>'
+            for label, value, css in metrics
+        )
+        rendered_cards.append(
+            f'<div class="detail-card"><div class="detail-card-heading">{thumbnail}'
+            f'<div class="detail-title" title="{escape(str(title), quote=True)}">{escape(str(title))}</div></div>'
+            f'<div class="detail-metrics">{metric_html}</div></div>{modal}'
+        )
+    css_class = " detail-card-grid" if columns == 2 else ""
+    st.markdown(f'<div id="{key}-campaign-previews" class="detail-card-list{css_class}">{"".join(rendered_cards)}</div>', unsafe_allow_html=True)
 
 
 def activity_card(label: str, value: str, delta: tuple[str, str], rate: str, rate_delta: tuple[str, str], comparison: str, secondary_delta: tuple[str, str], rate_secondary_delta: tuple[str, str]) -> None:
@@ -117,25 +199,51 @@ def ab_test_card(title: str, variants: list[dict[str, str]], winner: str, winnin
     )
 
 
-def module_performance_table(campaigns: list[tuple[str, str, list[tuple[str, str]]]]) -> None:
-    max_modules = max((len(modules) for _, _, modules in campaigns), default=0)
+def _table_campaign_preview(title: str, image_url: str, modal_id: str, subtitle: str = "") -> tuple[str, str]:
+    title_html = f'<strong>{escape(title)}</strong>'
+    if subtitle:
+        title_html += f'<span>{escape(subtitle)}</span>'
+    if not image_url:
+        return f'<div class="table-campaign"><div class="campaign-thumb campaign-thumb-empty">▧</div><div>{title_html}</div></div>', ""
+    safe_image = escape(image_url, quote=True)
+    preview = (
+        f'<a class="campaign-thumb-link" href="#{modal_id}" aria-label="Open image preview for {escape(title, quote=True)}">'
+        f'<img class="campaign-thumb" src="{safe_image}" alt="{escape(title, quote=True)}"></a>'
+    )
+    modal = (
+        f'<div id="{modal_id}" class="campaign-lightbox"><a class="campaign-lightbox-backdrop" href="#creative-tables" aria-label="Close preview"></a>'
+        f'<div class="campaign-lightbox-dialog"><a class="campaign-lightbox-close" href="#creative-tables" aria-label="Close preview">&times;</a>'
+        f'<img src="{safe_image}" alt="{escape(title, quote=True)}"><div>{escape(title)}</div></div></div>'
+    )
+    return f'<div class="table-campaign">{preview}<div>{title_html}</div></div>', modal
+
+
+def module_performance_table(campaigns: list[tuple[str, str, list[tuple[str, str]], str]]) -> None:
+    max_modules = max((len(modules) for _, _, modules, _ in campaigns), default=0)
     head = "".join(f"<th>Module {index + 1}</th>" for index in range(max_modules))
     rows = ""
-    for campaign, sent_date, modules in campaigns:
+    modals = ""
+    for index, (campaign, sent_date, modules, image_url) in enumerate(campaigns):
         cells = "".join(f'<td><strong>{escape(rate)}</strong><a href="{escape(url, quote=True)}" target="_blank" rel="noopener">{escape(url)}</a></td>' for url, rate in modules)
         cells += "<td>—</td>" * (max_modules - len(modules))
-        rows += f'<tr><th>{escape(campaign)}<span>Sent {escape(sent_date)}</span></th>{cells}</tr>'
-    st.markdown(f'<div class="module-table-wrap"><table class="module-table"><thead><tr><th>Campaign</th>{head}</tr></thead><tbody>{rows}</tbody></table></div>', unsafe_allow_html=True)
+        campaign_cell, modal = _table_campaign_preview(campaign, image_url, f"module-campaign-preview-{index}", f"Sent {sent_date}")
+        rows += f'<tr><th>{campaign_cell}</th>{cells}</tr>'
+        modals += modal
+    st.markdown(f'<div id="creative-tables" class="module-table-wrap"><table class="module-table"><thead><tr><th>Campaign</th>{head}</tr></thead><tbody>{rows}</tbody></table></div>{modals}', unsafe_allow_html=True)
 
 
 def top_creative_table(rows: list[dict[str, str]]) -> None:
-    body = "".join(
-        f'<tr><td><strong>{escape(row["campaign"])}</strong><span>{escape(row["module"])}</span></td>'
-        f'<td><a href="{escape(row["url"], quote=True)}" target="_blank" rel="noopener" title="{escape(row["url"], quote=True)}">{escape(row["url"])}</a></td>'
-        f'<td>{escape(row["clicks"])}</td><td class="top-rate">{escape(row["rate"])}</td></tr>'
-        for row in rows
-    )
-    st.markdown(f'<div class="module-table-wrap"><table class="top-creative-table"><thead><tr><th>Creative</th><th>URL</th><th>Unique Clicks</th><th>Click Rate</th></tr></thead><tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
+    body = ""
+    modals = ""
+    for index, row in enumerate(rows):
+        campaign_cell, modal = _table_campaign_preview(row["campaign"], row.get("image", ""), f"top-creative-preview-{index}", row["module"])
+        body += (
+            f'<tr><td>{campaign_cell}</td>'
+            f'<td><a href="{escape(row["url"], quote=True)}" target="_blank" rel="noopener" title="{escape(row["url"], quote=True)}">{escape(row["url"])}</a></td>'
+            f'<td>{escape(row["clicks"])}</td><td class="top-rate">{escape(row["rate"])}</td></tr>'
+        )
+        modals += modal
+    st.markdown(f'<div class="module-table-wrap"><table class="top-creative-table"><thead><tr><th>Creative</th><th>URL</th><th>Unique Clicks</th><th>Click Rate</th></tr></thead><tbody>{body}</tbody></table></div>{modals}', unsafe_allow_html=True)
 
 
 def comparison_label(mode: str) -> str:
