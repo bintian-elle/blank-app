@@ -5,8 +5,8 @@ import streamlit as st
 
 CSS = """
 <style>
-:root{--ink:#18212f;--muted:#788397;--line:#e9edf4;--brand:#6c5ce7;--brand2:#8b7cf6;--green:#10b981;--red:#ef5b67}
-.stApp{background:#f5f7fb;color:var(--ink)}.block-container{max-width:1480px;padding:2rem 2.4rem 4rem}
+:root{color-scheme:light;--ink:#18212f;--muted:#788397;--line:#e9edf4;--brand:#6c5ce7;--brand2:#8b7cf6;--green:#10b981;--red:#ef5b67}
+html,body,[data-testid="stAppViewContainer"],.stApp{background:#f5f7fb!important;color:var(--ink)!important}.block-container{max-width:1480px;padding:2rem 2.4rem 4rem}
 header[data-testid="stHeader"]{background:transparent}#MainMenu,footer{visibility:hidden}
 h1,h2,h3,p,div{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 h1{font-size:2rem!important;letter-spacing:-.035em;margin:0!important;color:#172033}
@@ -14,7 +14,8 @@ h1{font-size:2rem!important;letter-spacing:-.035em;margin:0!important;color:#172
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#171a2b 0%,#24243c 100%);border-right:0}
 [data-testid="stSidebar"] *{color:#d9dced!important}[data-testid="stSidebar"] a{border-radius:10px;margin:3px 8px}
 [data-testid="stSidebar"] a[aria-current="page"]{background:linear-gradient(90deg,#6c5ce7,#8b7cf6)!important;color:white!important}
-div[data-baseweb="select"]>div,div[data-testid="stDateInput"] input{border-color:#e0e5ef!important;border-radius:10px!important;background:#fff}
+div[data-baseweb="select"]>div,div[data-testid="stDateInput"] input{border-color:#e0e5ef!important;border-radius:10px!important;background:#fff!important;color:#18212f!important}
+div[data-baseweb="select"] span,div[data-baseweb="select"] svg,[data-testid="stDateInput"] input,[data-testid="stWidgetLabel"] p{color:#18212f!important}
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem}.brand-kicker{font-size:.9rem;color:#796cf2;font-weight:850;letter-spacing:.12em;text-transform:uppercase;margin-bottom:.18rem}
 .status{display:inline-flex;align-items:center;gap:.42rem;padding:.38rem .68rem;border-radius:999px;font-size:.72rem;font-weight:750;background:#ecfdf5;color:#087a50;border:1px solid #c7f1df}.dot{width:7px;height:7px;border-radius:99px;background:currentColor}
 .metric-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:1rem 1.05rem;min-height:114px;box-shadow:0 5px 22px rgba(28,38,63,.035)}

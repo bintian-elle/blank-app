@@ -9,6 +9,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 class KlaviyoError(RuntimeError):
@@ -20,15 +21,24 @@ class DateWindow:
     start: date
     end: date
 
-    def api_timeframe(self) -> dict[str, str]:
-        start_dt = datetime.combine(self.start, time.min, timezone.utc)
-        end_dt = datetime.combine(self.end + timedelta(days=1), time.min, timezone.utc)
+    @staticmethod
+    def _timezone(timezone_name: str) -> ZoneInfo | timezone:
+        try:
+            return ZoneInfo(timezone_name)
+        except Exception:
+            return timezone.utc
+
+    def api_timeframe(self, timezone_name: str = "UTC") -> dict[str, str]:
+        account_tz = self._timezone(timezone_name)
+        start_dt = datetime.combine(self.start, time.min, account_tz).astimezone(timezone.utc)
+        end_dt = datetime.combine(self.end + timedelta(days=1), time.min, account_tz).astimezone(timezone.utc)
         return {"start": start_dt.isoformat(), "end": end_dt.isoformat()}
 
-    def aggregate_filters(self) -> list[str]:
-        start_dt = datetime.combine(self.start, time.min, timezone.utc)
-        # less-than is exclusive, so use midnight after the selected end date.
-        end_dt = datetime.combine(self.end, time.max, timezone.utc)
+    def aggregate_filters(self, timezone_name: str = "UTC") -> list[str]:
+        account_tz = self._timezone(timezone_name)
+        start_dt = datetime.combine(self.start, time.min, account_tz).astimezone(timezone.utc)
+        # less-than is exclusive, so use local midnight after the selected end date.
+        end_dt = datetime.combine(self.end + timedelta(days=1), time.min, account_tz).astimezone(timezone.utc)
         return [
             f"greater-or-equal(datetime,{start_dt.isoformat().replace('+00:00', 'Z')})",
             f"less-than(datetime,{end_dt.isoformat().replace('+00:00', 'Z')})",
@@ -126,12 +136,48 @@ class KlaviyoClient:
         # while commerce integrations can expose multiple similarly named metrics.
         return {row.get("attributes", {}).get("name", ""): row.get("id", "") for row in rows}
 
+    def account_timezone(self) -> str:
+        document = self._request("GET", "accounts/")
+        rows = document.get("data") or []
+        if not rows:
+            return "UTC"
+        return str((rows[0].get("attributes") or {}).get("timezone") or "UTC")
+
+    def attributed_unsubscribe_profiles(self, metric_id: str, window: DateWindow, message_ids: tuple[str, ...], timezone_name: str) -> int:
+        """Count unique unsubscribe profiles attributed to messages in the report."""
+        if not metric_id or not message_ids:
+            return 0
+        try:
+            account_tz = ZoneInfo(timezone_name)
+        except Exception:
+            account_tz = timezone.utc
+        start_dt = datetime.combine(window.start, time.min, account_tz).astimezone(timezone.utc)
+        end_dt = datetime.combine(window.end + timedelta(days=1), time.min, account_tz).astimezone(timezone.utc)
+        event_filter = (
+            f'and(equals(metric_id,"{metric_id}"),'
+            f'greater-or-equal(datetime,{start_dt.isoformat().replace("+00:00", "Z")}),'
+            f'less-than(datetime,{end_dt.isoformat().replace("+00:00", "Z")}))'
+        )
+        rows = self.get_all("events/", params={"filter": event_filter, "page[size]": 100}, max_pages=50)
+        allowed = set(message_ids)
+        profiles = set()
+        for row in rows:
+            properties = (row.get("attributes") or {}).get("event_properties") or {}
+            if str(properties.get("method_detail") or "") not in allowed:
+                continue
+            profile = (row.get("relationships") or {}).get("profile", {}).get("data") or {}
+            profile_id = str(profile.get("id") or "")
+            if profile_id:
+                profiles.add(profile_id)
+        return len(profiles)
+
     def aggregate(
         self,
         metric_id: str,
         window: DateWindow,
         measurements: list[str],
         interval: str = "day",
+        timezone_name: str = "UTC",
     ) -> dict[str, Any]:
         payload = {
             "data": {
@@ -139,9 +185,9 @@ class KlaviyoClient:
                 "attributes": {
                     "metric_id": metric_id,
                     "measurements": measurements,
-                    "filter": window.aggregate_filters(),
+                    "filter": window.aggregate_filters(timezone_name),
                     "interval": interval,
-                    "timezone": "UTC",
+                    "timezone": timezone_name,
                     "page_size": 500,
                 },
             }
@@ -155,6 +201,7 @@ class KlaviyoClient:
         measurements: list[str],
         by: list[str],
         interval: str = "day",
+        timezone_name: str = "UTC",
     ) -> dict[str, Any]:
         payload = {
             "data": {
@@ -162,10 +209,10 @@ class KlaviyoClient:
                 "attributes": {
                     "metric_id": metric_id,
                     "measurements": measurements,
-                    "filter": window.aggregate_filters(),
+                    "filter": window.aggregate_filters(timezone_name),
                     "by": by,
                     "interval": interval,
-                    "timezone": "UTC",
+                    "timezone": timezone_name,
                     "page_size": 500,
                 },
             }
@@ -179,12 +226,13 @@ class KlaviyoClient:
         conversion_metric_id: str,
         statistics: list[str],
         group_by: list[str],
+        timezone_name: str = "UTC",
     ) -> list[dict[str, Any]]:
         payload = {
             "data": {
                 "type": report_type,
                 "attributes": {
-                    "timeframe": window.api_timeframe(),
+                    "timeframe": window.api_timeframe(timezone_name),
                     "conversion_metric_id": conversion_metric_id,
                     "statistics": statistics,
                     "group_by": group_by,
@@ -210,7 +258,7 @@ class KlaviyoClient:
         results = document.get("data", {}).get("attributes", {}).get("results", [])
         return {row.get("groupings", {}).get("segment_id", ""): float(row.get("statistics", {}).get("total_members") or 0) for row in results}
 
-    def campaign_details(self, channel: str) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    def campaign_details(self, channel: str, timezone_name: str = "UTC") -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         rows = self.get_all(
             "campaigns/",
             params={"filter": f'equals(messages.channel,"{channel}")', "include": "campaign-messages", "page[size]": 50},
@@ -222,7 +270,11 @@ class KlaviyoClient:
             attributes = row.get("attributes", {})
             sent_at = attributes.get("send_time") or attributes.get("scheduled_at")
             campaign_id = row.get("id", "")
-            dates[campaign_id] = str(sent_at or "")[:10]
+            try:
+                sent_date = datetime.fromisoformat(str(sent_at).replace("Z", "+00:00")).astimezone(DateWindow._timezone(timezone_name)).date().isoformat()
+            except (TypeError, ValueError):
+                sent_date = str(sent_at or "")[:10]
+            dates[campaign_id] = sent_date
             related_messages = row.get("relationships", {}).get("campaign-messages", {}).get("data", []) or []
             if related_messages:
                 message_ids[campaign_id] = str(related_messages[0].get("id") or "")

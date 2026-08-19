@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -13,7 +13,10 @@ from klaviyo_client import DateWindow, KlaviyoClient, KlaviyoError, values_from_
 
 METRIC_NAMES = ("Placed Order", "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam", "Unsubscribed from Email Marketing", "Sent Text Message", "Clicked Text Message", "Subscribed to Email Marketing", "Subscribed to Text Messaging Marketing", "Unsubscribed from Text Messaging Marketing")
 COMPARISON_METRICS = METRIC_NAMES
-REPORT_STATS = ["recipients", "delivered", "open_rate", "click_rate", "conversion_value", "conversions", "average_order_value", "unsubscribe_rate", "bounce_rate", "spam_complaint_rate"]
+REPORT_STATS = ["recipients", "delivered", "open_rate", "click_rate", "conversion_value", "conversions", "average_order_value", "unsubscribe_rate", "unsubscribe_uniques", "bounce_rate", "spam_complaint_rate"]
+REPORT_CACHE_VERSION = "2026-08-18-attributed-unsubscribers-v1"
+METADATA_TTL = 86400
+LIVE_DATA_TTL = 7200
 
 
 @st.cache_resource
@@ -26,10 +29,53 @@ def _total(values: dict[str, list[float]], measurement: str) -> float:
     return sum(values.get(measurement, []))
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
-def load_aggregates(api_key: str, revision: str, start: date, end: date, names: tuple[str, ...]) -> dict:
+@st.cache_data(ttl=METADATA_TTL, show_spinner=False)
+def load_metric_ids(api_key: str, revision: str) -> dict[str, str]:
+    """Metric IDs are account metadata and do not need fetching per period."""
+    return KlaviyoClient(api_key, revision).metrics()
+
+
+@st.cache_data(ttl=METADATA_TTL, show_spinner=False)
+def load_reporting_metadata(api_key: str, revision: str, timezone_name: str) -> dict[str, dict[str, str]]:
+    """Cache campaign/flow names, send dates and message relationships for 24h."""
+    client = KlaviyoClient(api_key, revision)
+    email_names, email_dates, email_message_ids = client.campaign_details("email", timezone_name)
+    sms_names, sms_dates, sms_message_ids = client.campaign_details("sms", timezone_name)
+    return {
+        "campaign_names": {**email_names, **sms_names},
+        "campaign_dates": {**email_dates, **sms_dates},
+        "campaign_message_ids": {**email_message_ids, **sms_message_ids},
+        "flow_names": client.flows(),
+    }
+
+
+def _metric_id_map(items: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    return dict(items)
+
+
+def _date_key(value: object) -> date | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _slice_metric(metric: dict, start: date, end: date) -> dict:
+    dates = metric.get("dates", [])
+    indexes = [index for index, value in enumerate(dates) if (parsed := _date_key(value)) and start <= parsed <= end]
+    return {
+        "dates": [dates[index] for index in indexes],
+        "values": {
+            measurement: [series[index] for index in indexes if index < len(series)]
+            for measurement, series in metric.get("values", {}).items()
+        },
+    }
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_aggregates(api_key: str, revision: str, start: date, end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
-    metric_ids = client.metrics()
+    metric_ids = _metric_id_map(metric_items)
     result: dict = {"metric_ids": metric_ids}
     for index, name in enumerate(names):
         metric_id = metric_ids.get(name)
@@ -38,11 +84,11 @@ def load_aggregates(api_key: str, revision: str, start: date, end: date, names: 
             continue
         measurements = ["count", "sum_value"] if name == "Placed Order" else ["count", "unique"]
         try:
-            attrs = client.aggregate(metric_id, window, measurements, "day")
+            attrs = client.aggregate(metric_id, window, measurements, "day", timezone_name)
         except KlaviyoError as exc:
             if "measurement" not in str(exc).lower():
                 raise
-            attrs = client.aggregate(metric_id, window, ["count"], "day")
+            attrs = client.aggregate(metric_id, window, ["count"], "day", timezone_name)
         dates, values = values_from_aggregate(attrs)
         result[name] = {"dates": dates, "values": values}
         if index < len(names) - 1:
@@ -50,25 +96,62 @@ def load_aggregates(api_key: str, revision: str, start: date, end: date, names: 
     return result
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
-def load_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool) -> dict:
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_adjacent_aggregates(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> tuple[dict, dict]:
+    """Fetch adjacent current/comparison windows once per metric, then split locally."""
+    combined_start, combined_end = min(start, previous_start), max(end, previous_end)
+    combined = load_aggregates(api_key, revision, combined_start, combined_end, names, metric_items, timezone_name)
+    metric_ids = combined["metric_ids"]
+    current: dict = {"metric_ids": metric_ids}
+    previous: dict = {"metric_ids": metric_ids}
+    for name in names:
+        current[name] = _slice_metric(combined.get(name, {}), start, end)
+        previous[name] = _slice_metric(combined.get(name, {}), previous_start, previous_end)
+    return current, previous
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
     group_campaign = ["campaign_message_id", "campaign_id", "campaign_message_name", "send_channel", "variation", "variation_name"]
     group_flow = ["flow_message_id", "flow_id", "flow_name", "send_channel"]
-    campaigns = client.reporting_values("campaign-values-report", window, order_id, REPORT_STATS, group_campaign)
-    flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, group_flow)
+    campaigns = client.reporting_values("campaign-values-report", window, order_id, REPORT_STATS, group_campaign, timezone_name)
+    flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, group_flow, timezone_name)
     previous_campaigns: list[dict] = []
     previous_flows: list[dict] = []
     if compare:
         previous_window = DateWindow(previous_start, previous_end)
-        previous_campaigns = client.reporting_values("campaign-values-report", previous_window, order_id, REPORT_STATS, group_campaign)
-        previous_flows = client.reporting_values("flow-values-report", previous_window, order_id, REPORT_STATS, group_flow)
-    email_names, email_dates, email_message_ids = client.campaign_details("email")
-    sms_names, sms_dates, sms_message_ids = client.campaign_details("sms")
-    return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows, "campaign_names": {**email_names, **sms_names}, "campaign_dates": {**email_dates, **sms_dates}, "campaign_message_ids": {**email_message_ids, **sms_message_ids}, "flow_names": client.flows()}
+        previous_campaigns = client.reporting_values("campaign-values-report", previous_window, order_id, REPORT_STATS, group_campaign, timezone_name)
+        previous_flows = client.reporting_values("flow-values-report", previous_window, order_id, REPORT_STATS, group_flow, timezone_name)
+    return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows}
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+def _report_message_ids(campaigns: list[dict], flows: list[dict]) -> tuple[str, ...]:
+    ids: set[str] = set()
+    for row in campaigns:
+        group = row.get("groupings") or {}
+        for field in ("campaign_message_id", "campaign_id", "variation"):
+            if group.get(field):
+                ids.add(str(group[field]))
+    for row in flows:
+        group = row.get("groupings") or {}
+        for field in ("flow_message_id", "flow_id"):
+            if group.get(field):
+                ids.add(str(group[field]))
+    return tuple(sorted(ids))
+
+
+@st.cache_data(ttl=METADATA_TTL, show_spinner=False)
+def load_account_timezone(api_key: str, revision: str) -> str:
+    return KlaviyoClient(api_key, revision).account_timezone()
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
+    return KlaviyoClient(api_key, revision).attributed_unsubscribe_profiles(metric_id, DateWindow(start, end), message_ids, timezone_name)
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
 def load_channel_revenue(api_key: str, revision: str, start: date, end: date, order_id: str, received_email_id: str = "", sent_text_id: str = "", activity_metric_ids: tuple[str, ...] = ()) -> dict[str, object]:
     """Load one reporting window and return the metrics needed by YoY overview cards."""
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
@@ -76,8 +159,9 @@ def load_channel_revenue(api_key: str, revision: str, start: date, end: date, or
     # request the required dimensions, then collapse them locally by channel.
     campaign_groupings = ["campaign_message_id", "campaign_id", "campaign_message_name", "send_channel", "variation", "variation_name"]
     flow_groupings = ["flow_message_id", "flow_id", "flow_name", "send_channel"]
-    campaigns = client.reporting_values("campaign-values-report", window, order_id, REPORT_STATS, campaign_groupings)
-    flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, flow_groupings)
+    timezone_name = load_account_timezone(api_key, revision)
+    campaigns = client.reporting_values("campaign-values-report", window, order_id, REPORT_STATS, campaign_groupings, timezone_name)
+    flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, flow_groupings, timezone_name)
     email_campaign = report_totals(campaigns, "email")["conversion_value"]
     email_flow = report_totals(flows, "email")["conversion_value"]
     email = email_campaign + email_flow
@@ -85,16 +169,21 @@ def load_channel_revenue(api_key: str, revision: str, start: date, end: date, or
     recipients = 0.0
     for metric_id in (received_email_id, sent_text_id):
         if metric_id:
-            _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, ["count"], "day"))
+            _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, ["count"], "day", timezone_name))
             recipients += sum(float(value or 0) for value in metric_values.get("count", []))
     activity_names = ("email_subscribers", "sms_subscribers", "email_unsubscribers", "sms_unsubscribers")
     activity_totals: dict[str, float] = {}
     for name, metric_id in zip(activity_names, activity_metric_ids):
         if not metric_id:
             continue
-        _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, ["count"], "day"))
+        _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, ["count"], "day", timezone_name))
         activity_totals[name] = sum(float(value or 0) for value in metric_values.get("count", []))
     email_health = report_totals(campaigns + flows, "email")
+    sms_health = report_totals(campaigns + flows, "sms")
+    # Match Klaviyo message-performance reporting rather than raw consent-event
+    # counts for unsubscribe comparisons.
+    activity_totals["email_unsubscribers"] = load_attributed_email_unsubscribers(api_key, revision, start, end, activity_metric_ids[2] if len(activity_metric_ids) > 2 else "", _report_message_ids(campaigns, flows), timezone_name)
+    activity_totals["sms_unsubscribers"] = sms_health["unsubscribe_uniques"]
     return {"email": email, "sms": sms, "edm": email + sms, "email_flow": email_flow, "email_campaign": email_campaign, "recipients": recipients, "flows": flows, "email_health": email_health, **activity_totals}
 
 
@@ -106,11 +195,12 @@ def load_subscriber_inventory(api_key: str, revision: str, email_segment_id: str
     return {"email": values.get(email_segment_id, 0), "sms": values.get(sms_segment_id, 0)}
 
 
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
 def load_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
     if not clicked_email_id:
         return {"dates": [], "data": []}
-    return KlaviyoClient(api_key, revision).aggregate_grouped(clicked_email_id, DateWindow(start, end), ["count", "unique"], ["Message Name", "URL"], "day")
+    timezone_name = load_account_timezone(api_key, revision)
+    return KlaviyoClient(api_key, revision).aggregate_grouped(clicked_email_id, DateWindow(start, end), ["count", "unique"], ["Message Name", "URL"], "day", timezone_name)
 
 
 class _LinkedAssetParser(HTMLParser):
@@ -233,12 +323,22 @@ def load_dashboard(api_key: str, revision: str, start: date, end: date, previous
         st.stop()
     try:
         with st.spinner("Loading live data from Klaviyo…"):
-            current = load_aggregates(api_key, revision, start, end, METRIC_NAMES)
-            previous = load_aggregates(api_key, revision, previous_start, previous_end, COMPARISON_METRICS) if compare else {}
+            timezone_name = load_account_timezone(api_key, revision)
+            metric_items = tuple(sorted(load_metric_ids(api_key, revision).items()))
+            adjacent = previous_end + timedelta(days=1) == start or end + timedelta(days=1) == previous_start
+            if compare and adjacent:
+                current, previous = load_adjacent_aggregates(api_key, revision, start, end, previous_start, previous_end, METRIC_NAMES, metric_items, timezone_name)
+            else:
+                current = load_aggregates(api_key, revision, start, end, METRIC_NAMES, metric_items, timezone_name)
+                previous = load_aggregates(api_key, revision, previous_start, previous_end, COMPARISON_METRICS, metric_items, timezone_name) if compare else {}
             order_id = current["metric_ids"].get("Placed Order")
             if not order_id:
                 raise KlaviyoError("Placed Order metric was not found")
-            reports = load_reports(api_key, revision, start, end, previous_start, previous_end, order_id, compare)
+            reports = load_reports(api_key, revision, start, end, previous_start, previous_end, order_id, compare, REPORT_CACHE_VERSION, timezone_name)
+            reports.update(load_reporting_metadata(api_key, revision, timezone_name))
+            email_unsubscribe_metric_id = current["metric_ids"].get("Unsubscribed from Email Marketing", "")
+            reports["email_unsubscribe_uniques"] = load_attributed_email_unsubscribers(api_key, revision, start, end, email_unsubscribe_metric_id, _report_message_ids(reports["campaigns"], reports["flows"]), timezone_name)
+            reports["previous_email_unsubscribe_uniques"] = load_attributed_email_unsubscribers(api_key, revision, previous_start, previous_end, email_unsubscribe_metric_id, _report_message_ids(reports["previous_campaigns"], reports["previous_flows"]), timezone_name) if compare else 0
         return current, previous, reports
     except KlaviyoError as exc:
         st.error(f"Klaviyo data could not be loaded: {exc}")
@@ -253,7 +353,7 @@ def aggregate(source: dict, name: str, measurement: str = "count") -> float:
 
 def report_totals(rows: list[dict], channel: str | None = None) -> dict[str, float]:
     selected = [r for r in rows if not channel or str(r.get("groupings", {}).get("send_channel") or "").strip().lower() == channel.strip().lower()]
-    sums = {k: sum(float(r.get("statistics", {}).get(k) or 0) for r in selected) for k in ["recipients", "delivered", "conversion_value", "conversions"]}
+    sums = {k: sum(float(r.get("statistics", {}).get(k) or 0) for r in selected) for k in ["recipients", "delivered", "conversion_value", "conversions", "unsubscribe_uniques"]}
     delivered = sums["delivered"]
     weighted = {k: sum(float(r.get("statistics", {}).get(k) or 0) * float(r.get("statistics", {}).get("delivered") or 0) for r in selected) / delivered if delivered else 0 for k in ["open_rate", "click_rate", "unsubscribe_rate", "bounce_rate", "spam_complaint_rate"]}
     return {**sums, **weighted, "average_order_value": sums["conversion_value"] / sums["conversions"] if sums["conversions"] else 0}

@@ -309,6 +309,8 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
     compare_date_key = f"{key}_compare_dates"
     date_draft_key = f"{key}_dates_draft"
     compare_draft_key = f"{key}_compare_dates_draft"
+    period_popover_version_key = f"{key}_period_popover_version"
+    compare_popover_version_key = f"{key}_compare_popover_version"
     period_options = ["Week-to-date", "Month-to-date", "Year-to-date", "Last 7 days", "Last 30 days", "Last 90 days", "Last month", "Last 3 months", "Last 12 months", "Last year", "Custom"]
 
     def month_start(value: date, offset: int = 0) -> date:
@@ -362,7 +364,8 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
                 st.session_state[date_key] = (today - timedelta(days=30), today)
             if date_draft_key not in st.session_state:
                 st.session_state[date_draft_key] = tuple(st.session_state[date_key])
-            with st.popover("📅 Set custom time period", width="stretch"):
+            period_popover_version = int(st.session_state.get(period_popover_version_key, 0))
+            with st.popover("📅 Set custom time period", width="stretch", key=f"{key}_period_popover_{period_popover_version}"):
                 st.caption("Type dates directly or choose them from the calendar.")
                 with st.form(f"{key}_period_form", border=False):
                     st.date_input("Custom time period", max_value=today, format="YYYY-MM-DD", key=date_draft_key, label_visibility="collapsed")
@@ -371,6 +374,7 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
                     draft = st.session_state.get(date_draft_key)
                     if isinstance(draft, tuple) and len(draft) == 2:
                         st.session_state[date_key] = tuple(draft)
+                        st.session_state[period_popover_version_key] = period_popover_version + 1
                         st.rerun()
             selected = st.session_state[date_key]
         else:
@@ -394,7 +398,8 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
                 st.session_state[compare_date_key] = (today - timedelta(days=59), today - timedelta(days=30))
             if compare_draft_key not in st.session_state:
                 st.session_state[compare_draft_key] = tuple(st.session_state[compare_date_key])
-            with st.popover("📅 Set custom comparison", width="stretch"):
+            compare_popover_version = int(st.session_state.get(compare_popover_version_key, 0))
+            with st.popover("📅 Set custom comparison", width="stretch", key=f"{key}_compare_popover_{compare_popover_version}"):
                 st.caption("Type dates directly or choose them from the calendar.")
                 with st.form(f"{key}_comparison_form", border=False):
                     st.date_input("Custom comparison period", max_value=today, format="YYYY-MM-DD", key=compare_draft_key, label_visibility="collapsed")
@@ -403,6 +408,7 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
                     draft = st.session_state.get(compare_draft_key)
                     if isinstance(draft, tuple) and len(draft) == 2:
                         st.session_state[compare_date_key] = tuple(draft)
+                        st.session_state[compare_popover_version_key] = compare_popover_version + 1
                         st.rerun()
             custom_comparison = st.session_state[compare_date_key]
     if not isinstance(selected, tuple) or len(selected) != 2:

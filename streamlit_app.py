@@ -177,7 +177,8 @@ for row_start in (0, 3):
 
 # 2 List health
 section("2", "LIST HEALTH")
-bounces, spam, email_unsubs = agg("Bounced Email"), agg("Marked Email as Spam"), agg("Unsubscribed from Email Marketing")
+bounces, spam = agg("Bounced Email"), agg("Marked Email as Spam")
+email_unsubs = float(reports.get("email_unsubscribe_uniques", email_all["unsubscribe_uniques"]))
 health_metrics, health_chart = st.columns([1, 2.2])
 with health_metrics:
     health_cards = st.columns(2)
@@ -196,9 +197,11 @@ with health_chart:
 
 # 3 Subscribers
 section("3", "SUBSCRIBERS")
-email_subs, sms_subs, sms_unsubs = agg("Subscribed to Email Marketing"), agg("Subscribed to Text Messaging Marketing"), agg("Unsubscribed from Text Messaging Marketing")
+email_subs, sms_subs = agg("Subscribed to Email Marketing"), agg("Subscribed to Text Messaging Marketing")
+sms_unsubs = sms_all["unsubscribe_uniques"]
 previous_email_subs, previous_sms_subs = agg("Subscribed to Email Marketing", prior=True), agg("Subscribed to Text Messaging Marketing", prior=True)
-previous_email_unsubs, previous_sms_unsubs = agg("Unsubscribed from Email Marketing", prior=True), agg("Unsubscribed from Text Messaging Marketing", prior=True)
+previous_email_unsubs = float(reports.get("previous_email_unsubscribe_uniques", previous_email_all["unsubscribe_uniques"]))
+previous_sms_unsubs = previous_sms_all["unsubscribe_uniques"]
 inventory = load_subscriber_inventory(API_KEY, REVISION, EMAIL_SUBSCRIBER_SEGMENT_ID, SMS_SUBSCRIBER_SEGMENT_ID)
 email_subscription_rate = email_subs / inventory["email"] if inventory["email"] else 0
 sms_subscription_rate = sms_subs / inventory["sms"] if inventory["sms"] else 0
@@ -243,9 +246,6 @@ with sms_activity[2]:
     line_chart(current["Subscribed to Text Messaging Marketing"]["dates"], {"New Subscribers": sms_daily, "Unsubscribers": sms_unsub_daily}, "sms_subscriber_activity", 267, colors=["#ffae00", "#ff6500"])
     st.markdown('</div>', unsafe_allow_html=True)
 
-flow_df = report_frame(reports["flows"], reports["flow_names"], "flow_id", limit=10)
-previous_flow_df = report_frame(reports["previous_flows"], reports["flow_names"], "flow_id", limit=100)
-yoy_flow_df = report_frame(yoy_revenue.get("flows", []), reports["flow_names"], "flow_id", limit=100) if yoy_revenue else pd.DataFrame(columns=flow_df.columns)
 email_campaign_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "email", None, reports.get("campaign_dates", {}))
 sms_campaign_df = report_frame(reports["campaigns"], reports["campaign_names"], "campaign_id", "sms", None, reports.get("campaign_dates", {}))
 
@@ -279,17 +279,25 @@ email_df, email_visible_count, email_campaign_count = paginated_campaigns(email_
 sms_df, sms_visible_count, sms_campaign_count = paginated_campaigns(sms_campaign_df, "sms")
 
 
-def select_flow(label: str, aliases: tuple[str, ...]) -> dict:
-    current_match = flow_df[flow_df["Name"].str.lower().apply(lambda name: any(alias in name for alias in aliases))]
-    previous_match = previous_flow_df[previous_flow_df["Name"].str.lower().apply(lambda name: any(alias in name for alias in aliases))]
-    yoy_match = yoy_flow_df[yoy_flow_df["Name"].str.lower().apply(lambda name: any(alias in name for alias in aliases))]
-    current_value = float(current_match["Revenue"].sum()) if not current_match.empty else 0
-    previous_value = float(previous_match["Revenue"].sum()) if not previous_match.empty else 0
-    yoy_value = float(yoy_match["Revenue"].sum()) if not yoy_match.empty else None
+def flow_revenue(rows: list[dict], aliases: tuple[str, ...], channel: str) -> float:
+    total = 0.0
+    for row in rows:
+        group = row.get("groupings", {})
+        name = str(group.get("flow_name") or reports["flow_names"].get(str(group.get("flow_id") or ""), "")).lower()
+        send_channel = str(group.get("send_channel") or "").strip().lower()
+        if send_channel == channel and any(alias in name for alias in aliases):
+            total += float(row.get("statistics", {}).get("conversion_value") or 0)
+    return total
+
+
+def select_flow(label: str, aliases: tuple[str, ...], channel: str = "email") -> dict:
+    current_value = flow_revenue(reports["flows"], aliases, channel)
+    previous_value = flow_revenue(reports["previous_flows"], aliases, channel)
+    yoy_value = flow_revenue(yoy_revenue.get("flows", []), aliases, channel) if yoy_revenue else None
     return {"Flow Name": label, "Revenue": current_value, "Previous Revenue": previous_value, "YoY Revenue": yoy_value}
 
 
-featured_flows = [select_flow("Welcome Flow", ("welcome",)), select_flow("SMS Welcome Flow", ("sms welcome", "welcome sms")), select_flow("Abandoned Checkout Flow", ("abandoned checkout", "checkout abandon")), select_flow("Abandoned Cart Flow", ("abandoned cart", "cart abandon")), select_flow("Post Purchase Flow", ("post purchase", "post-purchase"))]
+featured_flows = [select_flow("Welcome Flow", ("welcome",), "email"), select_flow("SMS Welcome Flow", ("welcome",), "sms"), select_flow("Abandoned Checkout Flow", ("abandoned checkout", "checkout abandon"), "email"), select_flow("Abandoned Cart Flow", ("abandoned cart", "cart abandon"), "email"), select_flow("Post Purchase Flow", ("post purchase", "post-purchase", "instructions", "reminders"), "email")]
 featured_flow_df = pd.DataFrame(featured_flows)
 
 
