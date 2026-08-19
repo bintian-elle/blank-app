@@ -10,7 +10,7 @@ import streamlit as st
 from dashboard.charts import line_chart
 from dashboard.components import ab_test_card, activity_card, change, comparison_label, date_filters, detail_cards, fmt_money, fmt_num, insight_card, module_performance_table, percent_change_text, section, sms_campaign_cards, top_creative_table
 from dashboard.config import API_KEY, EMAIL_SUBSCRIBER_SEGMENT_ID, REVISION, SMS_SUBSCRIBER_SEGMENT_ID
-from dashboard.data import ab_test_frame, aggregate, creative_module_frame, load_campaign_creatives, load_channel_revenue, load_creative_clicks, load_dashboard, load_sms_previews, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
+from dashboard.data import HISTORICAL_DATA_TTL, ab_test_frame, aggregate, creative_module_frame, load_campaign_creatives, load_channel_revenue, load_creative_clicks, load_dashboard, load_sms_previews, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
 from dashboard.styles import apply_styles
 from klaviyo_client import KlaviyoError
 
@@ -74,7 +74,7 @@ if stored_yoy and stored_yoy.get("window") == yoy_window_key:
     yoy_revenue = stored_yoy.get("revenue")
 shared_yoy = shared_yoy_store()
 shared_entry = shared_yoy.get(yoy_window_key)
-if shared_entry and time.time() - float(shared_entry.get("loaded_at", 0)) < 7200:
+if shared_entry and time.time() - float(shared_entry.get("loaded_at", 0)) < HISTORICAL_DATA_TTL:
     yoy_revenue = shared_entry.get("revenue")
 elif shared_entry:
     shared_yoy.pop(yoy_window_key, None)
@@ -363,7 +363,8 @@ loading_images = {name: "__loading__" for name, _ in email_messages}
 campaign_cards = st.empty()
 with campaign_cards.container():
     detail_cards(cards_from_frame(email_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Open rate", "Open Rate", rate, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)], loading_images), columns=2, key="email-loading")
-campaign_assets = load_campaign_creatives(API_KEY, REVISION, email_messages)
+with st.spinner("Loading email campaign previews…"):
+    campaign_assets = load_campaign_creatives(API_KEY, REVISION, email_messages)
 campaign_images = {name: assets[0]["image_url"] for name, assets in campaign_assets.items() if assets}
 with campaign_cards.container():
     detail_cards(cards_from_frame(email_df, "Name", [("Sent Date", "Sent Date", str, False), ("Revenue", "Revenue", money, False), ("Open rate", "Open Rate", rate, False), ("Click rate", "Click Rate", rate, False), ("Orders", "Orders", number, False), ("AOV", "Average Order Value ($)", money, False)], campaign_images), columns=2, key="email")
@@ -378,7 +379,8 @@ else:
     sms_cards = st.empty()
     with sms_cards.container():
         sms_campaign_cards(sms_cards_data, {name: {"loading": True} for name, _ in sms_messages}, columns=2, key="sms-loading")
-    sms_previews = load_sms_previews(API_KEY, REVISION, sms_messages)
+    with st.spinner("Loading SMS campaign previews…"):
+        sms_previews = load_sms_previews(API_KEY, REVISION, sms_messages)
     with sms_cards.container():
         sms_campaign_cards(sms_cards_data, sms_previews, columns=2, key="sms")
     campaign_load_more("sms", sms_visible_count, sms_campaign_count)
@@ -403,7 +405,8 @@ else:
             ab_test_card(str(campaign_name), variant_rows, winner, f"{winning_open_rate:.2%}", f"{open_rate_lift:.2%}" if open_rate_lift is not None else "—")
 
 section("8", "CAMPAIGN CREATIVE PERFORMANCE")
-creative_attributes = load_creative_clicks(API_KEY, REVISION, start, end, current["metric_ids"].get("Clicked Email", ""))
+with st.spinner("Loading creative URL performance…"):
+    creative_attributes = load_creative_clicks(API_KEY, REVISION, start, end, current["metric_ids"].get("Clicked Email", ""))
 delivered_by_message = {}
 for row in reports["campaigns"]:
     message_name = row.get("groupings", {}).get("campaign_message_name") or ""
@@ -450,4 +453,5 @@ if st.button("↻ Refresh Klaviyo data"):
     st.session_state.pop("dashboard_yoy_data", None)
     st.cache_data.clear()
     st.rerun()
-st.markdown(f'<div class="page-note">Data covers {start:%Y-%m-%d} to {end:%Y-%m-%d} from Klaviyo · API revision {REVISION} · Cached for 2 hours</div>', unsafe_allow_html=True)
+cache_note = "30 days" if end.year < time.localtime().tm_year else "2 hours"
+st.markdown(f'<div class="page-note">Data covers {start:%Y-%m-%d} to {end:%Y-%m-%d} from Klaviyo · API revision {REVISION} · Cached for {cache_note}</div>', unsafe_allow_html=True)

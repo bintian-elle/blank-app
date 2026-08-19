@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 from html.parser import HTMLParser
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -17,6 +18,7 @@ REPORT_STATS = ["recipients", "delivered", "open_rate", "click_rate", "conversio
 REPORT_CACHE_VERSION = "2026-08-18-attributed-unsubscribers-v1"
 METADATA_TTL = 86400
 LIVE_DATA_TTL = 7200
+HISTORICAL_DATA_TTL = 2592000
 
 
 @st.cache_resource
@@ -72,9 +74,9 @@ def _slice_metric(metric: dict, start: date, end: date) -> dict:
     }
 
 
-@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
-def load_aggregates(api_key: str, revision: str, start: date, end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
-    client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
+def _fetch_year_aggregates(api_key: str, revision: str, year: int, year_end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
+    client = KlaviyoClient(api_key, revision)
+    window = DateWindow(date(year, 1, 1), year_end)
     metric_ids = _metric_id_map(metric_items)
     result: dict = {"metric_ids": metric_ids}
     for index, name in enumerate(names):
@@ -97,21 +99,48 @@ def load_aggregates(api_key: str, revision: str, start: date, end: date, names: 
 
 
 @st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
-def load_adjacent_aggregates(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> tuple[dict, dict]:
-    """Fetch adjacent current/comparison windows once per metric, then split locally."""
-    combined_start, combined_end = min(start, previous_start), max(end, previous_end)
-    combined = load_aggregates(api_key, revision, combined_start, combined_end, names, metric_items, timezone_name)
-    metric_ids = combined["metric_ids"]
-    current: dict = {"metric_ids": metric_ids}
-    previous: dict = {"metric_ids": metric_ids}
+def load_current_year_aggregates(api_key: str, revision: str, year: int, year_end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
+    """Refresh the active calendar year every two hours."""
+    return _fetch_year_aggregates(api_key, revision, year, year_end, names, metric_items, timezone_name)
+
+
+@st.cache_data(ttl=HISTORICAL_DATA_TTL, show_spinner=False)
+def load_historical_year_aggregates(api_key: str, revision: str, year: int, year_end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
+    """Refresh completed calendar years every 30 days."""
+    return _fetch_year_aggregates(api_key, revision, year, year_end, names, metric_items, timezone_name)
+
+
+def _merge_year_metrics(year_data: list[dict], names: tuple[str, ...]) -> dict:
+    metric_ids = year_data[0]["metric_ids"] if year_data else {}
+    merged: dict = {"metric_ids": metric_ids}
     for name in names:
-        current[name] = _slice_metric(combined.get(name, {}), start, end)
-        previous[name] = _slice_metric(combined.get(name, {}), previous_start, previous_end)
-    return current, previous
+        dates: list = []
+        values: dict[str, list[float]] = {}
+        for yearly in year_data:
+            metric = yearly.get(name, {})
+            dates.extend(metric.get("dates", []))
+            for measurement, series in metric.get("values", {}).items():
+                values.setdefault(measurement, []).extend(series)
+        merged[name] = {"dates": dates, "values": values}
+    return merged
 
 
-@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
-def load_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
+def load_period_aggregates(api_key: str, revision: str, start: date, end: date, names: tuple[str, ...], metric_items: tuple[tuple[str, str], ...], timezone_name: str) -> dict:
+    """Build any selected period from reusable calendar-year daily caches."""
+    today = date.today()
+    yearly = []
+    for year in range(start.year, end.year + 1):
+        year_end = min(date(year, 12, 31), today) if year == today.year else date(year, 12, 31)
+        loader = load_current_year_aggregates if year == today.year else load_historical_year_aggregates
+        yearly.append(loader(api_key, revision, year, year_end, names, metric_items, timezone_name))
+    merged = _merge_year_metrics(yearly, names)
+    result: dict = {"metric_ids": merged["metric_ids"]}
+    for name in names:
+        result[name] = _slice_metric(merged.get(name, {}), start, end)
+    return result
+
+
+def _fetch_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
     group_campaign = ["campaign_message_id", "campaign_id", "campaign_message_name", "send_channel", "variation", "variation_name"]
     group_flow = ["flow_message_id", "flow_id", "flow_name", "send_channel"]
@@ -124,6 +153,22 @@ def load_reports(api_key: str, revision: str, start: date, end: date, previous_s
         previous_campaigns = client.reporting_values("campaign-values-report", previous_window, order_id, REPORT_STATS, group_campaign, timezone_name)
         previous_flows = client.reporting_values("flow-values-report", previous_window, order_id, REPORT_STATS, group_flow, timezone_name)
     return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows}
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_live_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
+    return _fetch_reports(api_key, revision, start, end, previous_start, previous_end, order_id, compare, cache_version, timezone_name)
+
+
+@st.cache_data(ttl=HISTORICAL_DATA_TTL, show_spinner=False)
+def load_historical_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
+    return _fetch_reports(api_key, revision, start, end, previous_start, previous_end, order_id, compare, cache_version, timezone_name)
+
+
+def load_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
+    latest_end = max(end, previous_end) if compare else end
+    loader = load_historical_reports if latest_end.year < date.today().year else load_live_reports
+    return loader(api_key, revision, start, end, previous_start, previous_end, order_id, compare, cache_version, timezone_name)
 
 
 def _report_message_ids(campaigns: list[dict], flows: list[dict]) -> tuple[str, ...]:
@@ -146,12 +191,26 @@ def load_account_timezone(api_key: str, revision: str) -> str:
     return KlaviyoClient(api_key, revision).account_timezone()
 
 
-@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
-def load_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
+def _fetch_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
     return KlaviyoClient(api_key, revision).attributed_unsubscribe_profiles(metric_id, DateWindow(start, end), message_ids, timezone_name)
 
 
 @st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_live_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
+    return _fetch_attributed_email_unsubscribers(api_key, revision, start, end, metric_id, message_ids, timezone_name)
+
+
+@st.cache_data(ttl=HISTORICAL_DATA_TTL, show_spinner=False)
+def load_historical_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
+    return _fetch_attributed_email_unsubscribers(api_key, revision, start, end, metric_id, message_ids, timezone_name)
+
+
+def load_attributed_email_unsubscribers(api_key: str, revision: str, start: date, end: date, metric_id: str, message_ids: tuple[str, ...], timezone_name: str) -> int:
+    loader = load_historical_attributed_email_unsubscribers if end.year < date.today().year else load_live_attributed_email_unsubscribers
+    return loader(api_key, revision, start, end, metric_id, message_ids, timezone_name)
+
+
+@st.cache_data(ttl=HISTORICAL_DATA_TTL, show_spinner=False)
 def load_channel_revenue(api_key: str, revision: str, start: date, end: date, order_id: str, received_email_id: str = "", sent_text_id: str = "", activity_metric_ids: tuple[str, ...] = ()) -> dict[str, object]:
     """Load one reporting window and return the metrics needed by YoY overview cards."""
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
@@ -195,12 +254,26 @@ def load_subscriber_inventory(api_key: str, revision: str, email_segment_id: str
     return {"email": values.get(email_segment_id, 0), "sms": values.get(sms_segment_id, 0)}
 
 
-@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
-def load_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
+def _fetch_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
     if not clicked_email_id:
         return {"dates": [], "data": []}
     timezone_name = load_account_timezone(api_key, revision)
     return KlaviyoClient(api_key, revision).aggregate_grouped(clicked_email_id, DateWindow(start, end), ["count", "unique"], ["Message Name", "URL"], "day", timezone_name)
+
+
+@st.cache_data(ttl=LIVE_DATA_TTL, show_spinner=False)
+def load_live_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
+    return _fetch_creative_clicks(api_key, revision, start, end, clicked_email_id)
+
+
+@st.cache_data(ttl=HISTORICAL_DATA_TTL, show_spinner=False)
+def load_historical_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
+    return _fetch_creative_clicks(api_key, revision, start, end, clicked_email_id)
+
+
+def load_creative_clicks(api_key: str, revision: str, start: date, end: date, clicked_email_id: str) -> dict:
+    loader = load_historical_creative_clicks if end.year < date.today().year else load_live_creative_clicks
+    return loader(api_key, revision, start, end, clicked_email_id)
 
 
 class _LinkedAssetParser(HTMLParser):
@@ -325,20 +398,27 @@ def load_dashboard(api_key: str, revision: str, start: date, end: date, previous
         with st.spinner("Loading live data from Klaviyo…"):
             timezone_name = load_account_timezone(api_key, revision)
             metric_items = tuple(sorted(load_metric_ids(api_key, revision).items()))
-            adjacent = previous_end + timedelta(days=1) == start or end + timedelta(days=1) == previous_start
-            if compare and adjacent:
-                current, previous = load_adjacent_aggregates(api_key, revision, start, end, previous_start, previous_end, METRIC_NAMES, metric_items, timezone_name)
-            else:
-                current = load_aggregates(api_key, revision, start, end, METRIC_NAMES, metric_items, timezone_name)
-                previous = load_aggregates(api_key, revision, previous_start, previous_end, COMPARISON_METRICS, metric_items, timezone_name) if compare else {}
-            order_id = current["metric_ids"].get("Placed Order")
+            order_id = dict(metric_items).get("Placed Order")
             if not order_id:
                 raise KlaviyoError("Placed Order metric was not found")
-            reports = load_reports(api_key, revision, start, end, previous_start, previous_end, order_id, compare, REPORT_CACHE_VERSION, timezone_name)
+            all_start = min(start, previous_start) if compare else start
+            all_end = max(end, previous_end) if compare else end
+            # Metric aggregates and Reporting API use separate endpoint quotas,
+            # so they can safely run together without increasing either burst.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                aggregate_future = executor.submit(load_period_aggregates, api_key, revision, all_start, all_end, METRIC_NAMES, metric_items, timezone_name)
+                reports_future = executor.submit(load_reports, api_key, revision, start, end, previous_start, previous_end, order_id, compare, REPORT_CACHE_VERSION, timezone_name)
+                combined = aggregate_future.result()
+                reports = reports_future.result()
+            current = {"metric_ids": combined["metric_ids"], **{name: _slice_metric(combined.get(name, {}), start, end) for name in METRIC_NAMES}}
+            previous = {"metric_ids": combined["metric_ids"], **{name: _slice_metric(combined.get(name, {}), previous_start, previous_end) for name in COMPARISON_METRICS}} if compare else {}
             reports.update(load_reporting_metadata(api_key, revision, timezone_name))
             email_unsubscribe_metric_id = current["metric_ids"].get("Unsubscribed from Email Marketing", "")
-            reports["email_unsubscribe_uniques"] = load_attributed_email_unsubscribers(api_key, revision, start, end, email_unsubscribe_metric_id, _report_message_ids(reports["campaigns"], reports["flows"]), timezone_name)
-            reports["previous_email_unsubscribe_uniques"] = load_attributed_email_unsubscribers(api_key, revision, previous_start, previous_end, email_unsubscribe_metric_id, _report_message_ids(reports["previous_campaigns"], reports["previous_flows"]), timezone_name) if compare else 0
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                current_unsubs = executor.submit(load_attributed_email_unsubscribers, api_key, revision, start, end, email_unsubscribe_metric_id, _report_message_ids(reports["campaigns"], reports["flows"]), timezone_name)
+                previous_unsubs = executor.submit(load_attributed_email_unsubscribers, api_key, revision, previous_start, previous_end, email_unsubscribe_metric_id, _report_message_ids(reports["previous_campaigns"], reports["previous_flows"]), timezone_name) if compare else None
+                reports["email_unsubscribe_uniques"] = current_unsubs.result()
+                reports["previous_email_unsubscribe_uniques"] = previous_unsubs.result() if previous_unsubs else 0
         return current, previous, reports
     except KlaviyoError as exc:
         st.error(f"Klaviyo data could not be loaded: {exc}")

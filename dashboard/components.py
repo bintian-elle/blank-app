@@ -311,7 +311,9 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
     compare_draft_key = f"{key}_compare_dates_draft"
     period_popover_version_key = f"{key}_period_popover_version"
     compare_popover_version_key = f"{key}_compare_popover_version"
-    period_options = ["Week-to-date", "Month-to-date", "Year-to-date", "Last 7 days", "Last 30 days", "Last 90 days", "Last month", "Last 3 months", "Last 12 months", "Last year", "Custom"]
+    period_options = ["Week-to-date", "Month-to-date", "Year-to-date", "Last 7 days", "Last 30 days", "Last 90 days", "Custom"]
+    if st.session_state.get(period_key) not in (*period_options, None):
+        st.session_state[period_key] = "Last 30 days"
 
     def month_start(value: date, offset: int = 0) -> date:
         month_index = value.year * 12 + value.month - 1 + offset

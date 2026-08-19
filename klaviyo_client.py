@@ -158,7 +158,15 @@ class KlaviyoClient:
             f'greater-or-equal(datetime,{start_dt.isoformat().replace("+00:00", "Z")}),'
             f'less-than(datetime,{end_dt.isoformat().replace("+00:00", "Z")}))'
         )
-        rows = self.get_all("events/", params={"filter": event_filter, "page[size]": 100}, max_pages=50)
+        rows = self.get_all(
+            "events/",
+            params={
+                "filter": event_filter,
+                "page[size]": 200,
+                "fields[event]": "event_properties",
+            },
+            max_pages=50,
+        )
         allowed = set(message_ids)
         profiles = set()
         for row in rows:
