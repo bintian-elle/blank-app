@@ -266,10 +266,15 @@ class KlaviyoClient:
         results = document.get("data", {}).get("attributes", {}).get("results", [])
         return {row.get("groupings", {}).get("segment_id", ""): float(row.get("statistics", {}).get("total_members") or 0) for row in results}
 
-    def campaign_details(self, channel: str, timezone_name: str = "UTC") -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    def campaign_details(self, channel: str, timezone_name: str = "UTC", campaign_ids: tuple[str, ...] = ()) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        channel_filter = f'equals(messages.channel,"{channel}")'
+        if campaign_ids:
+            ids = ",".join(json.dumps(value) for value in campaign_ids)
+            channel_filter = f"and({channel_filter},any(id,[{ids}]))"
         rows = self.get_all(
             "campaigns/",
-            params={"filter": f'equals(messages.channel,"{channel}")', "include": "campaign-messages", "page[size]": 50},
+            params={"filter": channel_filter, "include": "campaign-messages", "page[size]": 100},
+            max_pages=2 if campaign_ids else 20,
         )
         names = {row.get("id", ""): row.get("attributes", {}).get("name", "Unnamed campaign") for row in rows}
         dates = {}
@@ -287,6 +292,39 @@ class KlaviyoClient:
             if related_messages:
                 message_ids[campaign_id] = str(related_messages[0].get("id") or "")
         return names, dates, message_ids
+
+    def campaign_details_by_names(self, channel: str, names: tuple[str, ...], timezone_name: str = "UTC") -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+        """Resolve a small set of report message names without scanning all campaigns."""
+        campaign_names: dict[str, str] = {}
+        dates: dict[str, str] = {}
+        message_ids: dict[str, str] = {}
+        requested_ids: dict[str, str] = {}
+        for requested_name in names:
+            channel_filter = f'equals(messages.channel,"{channel}")'
+            name_filter = f"contains(name,{json.dumps(requested_name)})"
+            rows = self.get_all(
+                "campaigns/",
+                params={"filter": f"and({channel_filter},{name_filter})", "include": "campaign-messages", "page[size]": 20},
+                max_pages=1,
+            )
+            if not rows:
+                continue
+            row = next((item for item in rows if str((item.get("attributes") or {}).get("name") or "") == requested_name), rows[0])
+            attributes = row.get("attributes") or {}
+            campaign_id = str(row.get("id") or "")
+            actual_name = str(attributes.get("name") or requested_name)
+            sent_at = attributes.get("send_time") or attributes.get("scheduled_at")
+            try:
+                sent_date = datetime.fromisoformat(str(sent_at).replace("Z", "+00:00")).astimezone(DateWindow._timezone(timezone_name)).date().isoformat()
+            except (TypeError, ValueError):
+                sent_date = str(sent_at or "")[:10]
+            related_messages = row.get("relationships", {}).get("campaign-messages", {}).get("data", []) or []
+            campaign_names[campaign_id] = actual_name
+            dates[campaign_id] = sent_date
+            requested_ids[requested_name] = campaign_id
+            if related_messages:
+                message_ids[campaign_id] = str(related_messages[0].get("id") or "")
+        return campaign_names, dates, message_ids, requested_ids
 
     def campaigns(self, channel: str) -> dict[str, str]:
         names, _, _ = self.campaign_details(channel)

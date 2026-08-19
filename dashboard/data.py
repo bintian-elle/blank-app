@@ -38,16 +38,49 @@ def load_metric_ids(api_key: str, revision: str) -> dict[str, str]:
 
 
 @st.cache_data(ttl=METADATA_TTL, show_spinner=False)
-def load_reporting_metadata(api_key: str, revision: str, timezone_name: str) -> dict[str, dict[str, str]]:
-    """Cache campaign/flow names, send dates and message relationships for 24h."""
+def load_reporting_metadata(api_key: str, revision: str, timezone_name: str, campaign_channels: tuple[tuple[str, str], ...], flow_items: tuple[tuple[str, str], ...]) -> dict[str, dict[str, str]]:
+    """Fetch metadata only for campaigns present in the selected reports."""
     client = KlaviyoClient(api_key, revision)
-    email_names, email_dates, email_message_ids = client.campaign_details("email", timezone_name)
-    sms_names, sms_dates, sms_message_ids = client.campaign_details("sms", timezone_name)
+    ids_by_channel = {
+        channel: tuple(campaign_id for campaign_id, item_channel in campaign_channels if item_channel == channel)
+        for channel in ("email", "sms")
+    }
+    email_names, email_dates, email_message_ids = client.campaign_details("email", timezone_name, ids_by_channel["email"]) if ids_by_channel["email"] else ({}, {}, {})
+    sms_names, sms_dates, sms_message_ids = client.campaign_details("sms", timezone_name, ids_by_channel["sms"]) if ids_by_channel["sms"] else ({}, {}, {})
     return {
         "campaign_names": {**email_names, **sms_names},
         "campaign_dates": {**email_dates, **sms_dates},
         "campaign_message_ids": {**email_message_ids, **sms_message_ids},
-        "flow_names": client.flows(),
+        "flow_names": dict(flow_items),
+    }
+
+
+def _reporting_metadata_keys(reports: dict) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    campaign_channels: set[tuple[str, str]] = set()
+    flow_items: set[tuple[str, str]] = set()
+    for row in reports.get("campaigns", []) + reports.get("previous_campaigns", []):
+        group = row.get("groupings") or {}
+        campaign_id = str(group.get("campaign_id") or "")
+        channel = str(group.get("send_channel") or "").strip().lower()
+        if campaign_id and channel in ("email", "sms"):
+            campaign_channels.add((campaign_id, channel))
+    for row in reports.get("flows", []) + reports.get("previous_flows", []):
+        group = row.get("groupings") or {}
+        flow_id = str(group.get("flow_id") or "")
+        flow_name = str(group.get("flow_name") or "Unnamed flow")
+        if flow_id:
+            flow_items.add((flow_id, flow_name))
+    return tuple(sorted(campaign_channels)), tuple(sorted(flow_items))
+
+
+@st.cache_data(ttl=METADATA_TTL, show_spinner=False)
+def load_campaign_metadata_by_names(api_key: str, revision: str, timezone_name: str, names: tuple[str, ...]) -> dict[str, dict[str, str]]:
+    campaign_names, dates, message_ids, requested_ids = KlaviyoClient(api_key, revision).campaign_details_by_names("email", names, timezone_name)
+    return {
+        "campaign_names": campaign_names,
+        "campaign_dates": dates,
+        "campaign_message_ids": message_ids,
+        "requested_ids": requested_ids,
     }
 
 
@@ -168,7 +201,32 @@ def load_historical_reports(api_key: str, revision: str, start: date, end: date,
 def load_reports(api_key: str, revision: str, start: date, end: date, previous_start: date, previous_end: date, order_id: str, compare: bool, cache_version: str, timezone_name: str) -> dict:
     latest_end = max(end, previous_end) if compare else end
     loader = load_historical_reports if latest_end.year < date.today().year else load_live_reports
-    return loader(api_key, revision, start, end, previous_start, previous_end, order_id, compare, cache_version, timezone_name)
+    if not compare:
+        return loader(api_key, revision, start, end, previous_start, previous_end, order_id, False, cache_version, timezone_name)
+
+    current_window = (start, end)
+    comparison_window = (previous_start, previous_end)
+    first_window, second_window = sorted((current_window, comparison_window))
+    reports = loader(
+        api_key,
+        revision,
+        first_window[0],
+        first_window[1],
+        second_window[0],
+        second_window[1],
+        order_id,
+        True,
+        cache_version,
+        timezone_name,
+    )
+    if first_window == current_window:
+        return reports
+    return {
+        "campaigns": reports["previous_campaigns"],
+        "flows": reports["previous_flows"],
+        "previous_campaigns": reports["campaigns"],
+        "previous_flows": reports["flows"],
+    }
 
 
 def _report_message_ids(campaigns: list[dict], flows: list[dict]) -> tuple[str, ...]:
@@ -335,7 +393,9 @@ def load_campaign_creatives(api_key: str, revision: str, messages: tuple[tuple[s
     cached_assets = campaign_creative_store()
     result: dict[str, list[dict[str, str]]] = {}
     for message_name, message_id in messages:
-        if message_id in cached_assets:
+        # Only positive results are permanent. A template can temporarily be
+        # unavailable or the first resolved message can be an empty variation.
+        if cached_assets.get(message_id):
             result[message_name] = cached_assets[message_id]
             continue
         try:
@@ -347,7 +407,8 @@ def load_campaign_creatives(api_key: str, revision: str, messages: tuple[tuple[s
                 key=_asset_score,
                 reverse=True,
             )
-            cached_assets[message_id] = assets
+            if assets:
+                cached_assets[message_id] = assets
             result[message_name] = assets
         except (KlaviyoError, AttributeError, TypeError, ValueError):
             # Do not cache transient API errors; the next rerun can try again.
@@ -412,7 +473,9 @@ def load_dashboard(api_key: str, revision: str, start: date, end: date, previous
                 reports = reports_future.result()
             current = {"metric_ids": combined["metric_ids"], **{name: _slice_metric(combined.get(name, {}), start, end) for name in METRIC_NAMES}}
             previous = {"metric_ids": combined["metric_ids"], **{name: _slice_metric(combined.get(name, {}), previous_start, previous_end) for name in COMPARISON_METRICS}} if compare else {}
-            reports.update(load_reporting_metadata(api_key, revision, timezone_name))
+            campaign_channels, flow_items = _reporting_metadata_keys(reports)
+            reports.update(load_reporting_metadata(api_key, revision, timezone_name, campaign_channels, flow_items))
+            reports["account_timezone"] = timezone_name
             email_unsubscribe_metric_id = current["metric_ids"].get("Unsubscribed from Email Marketing", "")
             with ThreadPoolExecutor(max_workers=2) as executor:
                 current_unsubs = executor.submit(load_attributed_email_unsubscribers, api_key, revision, start, end, email_unsubscribe_metric_id, _report_message_ids(reports["campaigns"], reports["flows"]), timezone_name)

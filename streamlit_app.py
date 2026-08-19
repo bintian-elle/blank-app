@@ -10,7 +10,7 @@ import streamlit as st
 from dashboard.charts import line_chart
 from dashboard.components import ab_test_card, activity_card, change, comparison_label, date_filters, detail_cards, fmt_money, fmt_num, insight_card, module_performance_table, percent_change_text, section, sms_campaign_cards, top_creative_table
 from dashboard.config import API_KEY, EMAIL_SUBSCRIBER_SEGMENT_ID, REVISION, SMS_SUBSCRIBER_SEGMENT_ID
-from dashboard.data import HISTORICAL_DATA_TTL, ab_test_frame, aggregate, creative_module_frame, load_campaign_creatives, load_channel_revenue, load_creative_clicks, load_dashboard, load_sms_previews, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
+from dashboard.data import HISTORICAL_DATA_TTL, ab_test_frame, aggregate, creative_module_frame, load_campaign_creatives, load_campaign_metadata_by_names, load_channel_revenue, load_creative_clicks, load_dashboard, load_sms_previews, load_subscriber_inventory, report_frame, report_totals, shared_yoy_store
 from dashboard.styles import apply_styles
 from klaviyo_client import KlaviyoError
 
@@ -337,11 +337,14 @@ def campaign_messages(frame: pd.DataFrame, channel: str) -> tuple[tuple[str, str
         if campaign_id and message_id and campaign_id not in message_by_campaign:
             message_by_campaign[campaign_id] = message_id
     campaign_id_by_name = {name: campaign_id for campaign_id, name in reports["campaign_names"].items()}
-    return tuple(
-        (str(row["Name"]), message_by_campaign[campaign_id_by_name[str(row["Name"])]])
-        for _, row in frame.iterrows()
-        if str(row["Name"]) in campaign_id_by_name and campaign_id_by_name[str(row["Name"])] in message_by_campaign
-    )
+    resolved: list[tuple[str, str]] = []
+    for _, row in frame.iterrows():
+        name = str(row["Name"])
+        campaign_id = campaign_id_by_name.get(name, "")
+        message_id = message_by_campaign.get(campaign_id) or reports.get("campaign_message_ids", {}).get(campaign_id, "")
+        if campaign_id and message_id:
+            resolved.append((name, str(message_id)))
+    return tuple(resolved)
 
 
 money = lambda value: fmt_money(float(value or 0))
@@ -425,6 +428,21 @@ else:
             "campaign": reports["campaign_names"].get(campaign_id, message_name),
             "sent_date": reports.get("campaign_dates", {}).get(campaign_id, "—") or "—",
         }
+    missing_metadata_names = tuple(
+        name for name in dict.fromkeys(creative_df["Campaign"].astype(str).tolist())
+        if name and name not in message_metadata
+    )
+    if missing_metadata_names:
+        with st.spinner("Resolving older campaign previews…"):
+            supplemental = load_campaign_metadata_by_names(API_KEY, REVISION, reports.get("account_timezone", "America/Chicago"), missing_metadata_names)
+        reports["campaign_names"].update(supplemental["campaign_names"])
+        reports["campaign_dates"].update(supplemental["campaign_dates"])
+        reports["campaign_message_ids"].update(supplemental["campaign_message_ids"])
+        for requested_name, campaign_id in supplemental["requested_ids"].items():
+            message_metadata[requested_name] = {
+                "campaign": supplemental["campaign_names"].get(campaign_id, requested_name),
+                "sent_date": supplemental["campaign_dates"].get(campaign_id, "—") or "—",
+            }
     creative_df["Campaign Name"] = creative_df["Campaign"].map(lambda name: message_metadata.get(str(name), {}).get("campaign", str(name)))
     creative_df["Sent Date"] = creative_df["Campaign"].map(lambda name: message_metadata.get(str(name), {}).get("sent_date", "—"))
     creative_df["_sent_at"] = pd.to_datetime(creative_df["Sent Date"], errors="coerce", utc=True)
