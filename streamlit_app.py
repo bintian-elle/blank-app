@@ -198,10 +198,10 @@ with health_chart:
 # 3 Subscribers
 section("3", "SUBSCRIBERS")
 email_subs, sms_subs = agg("Subscribed to Email Marketing"), agg("Subscribed to Text Messaging Marketing")
-sms_unsubs = sms_all["unsubscribe_uniques"]
+sms_unsubs = agg("Unsubscribed from Text Messaging Marketing", "unique")
 previous_email_subs, previous_sms_subs = agg("Subscribed to Email Marketing", prior=True), agg("Subscribed to Text Messaging Marketing", prior=True)
 previous_email_unsubs = float(reports.get("previous_email_unsubscribe_uniques", previous_email_all["unsubscribe_uniques"]))
-previous_sms_unsubs = previous_sms_all["unsubscribe_uniques"]
+previous_sms_unsubs = agg("Unsubscribed from Text Messaging Marketing", "unique", True)
 inventory = load_subscriber_inventory(API_KEY, REVISION, EMAIL_SUBSCRIBER_SEGMENT_ID, SMS_SUBSCRIBER_SEGMENT_ID)
 email_subscription_rate = email_subs / inventory["email"] if inventory["email"] else 0
 sms_subscription_rate = sms_subs / inventory["sms"] if inventory["sms"] else 0

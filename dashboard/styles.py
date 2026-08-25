@@ -16,6 +16,11 @@ h1{font-size:2rem!important;letter-spacing:-.035em;margin:0!important;color:#172
 [data-testid="stSidebar"] a[aria-current="page"]{background:linear-gradient(90deg,#6c5ce7,#8b7cf6)!important;color:white!important}
 div[data-baseweb="select"]>div,div[data-testid="stDateInput"] input{border-color:#e0e5ef!important;border-radius:10px!important;background:#fff!important;color:#18212f!important}
 div[data-baseweb="select"] span,div[data-baseweb="select"] svg,[data-testid="stDateInput"] input,[data-testid="stWidgetLabel"] p{color:#18212f!important}
+/* BaseWeb renders Selectbox menus in a body-level portal.  The listbox and
+   options are divs in current Streamlit releases (not ul/li elements). */
+[role="listbox"],[role="listbox"]>div,[data-baseweb="menu"]{max-height:min(440px,calc(100vh - 72px))!important}
+[role="listbox"]{overflow-y:auto!important}
+[role="option"]{min-height:34px!important;padding-top:5px!important;padding-bottom:5px!important}
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem}.brand-kicker{font-size:.9rem;color:#796cf2;font-weight:850;letter-spacing:.12em;text-transform:uppercase;margin-bottom:.18rem}
 .status{display:inline-flex;align-items:center;gap:.42rem;padding:.38rem .68rem;border-radius:999px;font-size:.72rem;font-weight:750;background:#ecfdf5;color:#087a50;border:1px solid #c7f1df}.dot{width:7px;height:7px;border-radius:99px;background:currentColor}
 .metric-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:1rem 1.05rem;min-height:114px;box-shadow:0 5px 22px rgba(28,38,63,.035)}

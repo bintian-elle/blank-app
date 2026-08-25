@@ -307,7 +307,11 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
     compare_draft_key = f"{key}_compare_dates_draft"
     period_popover_version_key = f"{key}_period_popover_version"
     compare_popover_version_key = f"{key}_compare_popover_version"
-    period_options = ["Week-to-date", "Month-to-date", "Year-to-date", "Last 7 days", "Last 30 days", "Last 90 days", "Custom"]
+    last_week_label = "Last Week (Tue–Mon)"
+    period_options = [last_week_label, "Week-to-date", "Month-to-date", "Year-to-date", "Last 7 days", "Last 30 days", "Last 90 days", "Custom"]
+    # Preserve an existing browser session that still stores the old label.
+    if st.session_state.get(period_key) == "Last Week":
+        st.session_state[period_key] = last_week_label
     if st.session_state.get(period_key) not in (*period_options, None):
         st.session_state[period_key] = "Last 30 days"
 
@@ -323,6 +327,9 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
         if period_name == "Month-to-date": return today.replace(day=1), today
         if period_name == "Year-to-date": return today.replace(month=1, day=1), today
         if period_name == "Last 7 days": return today - timedelta(days=7), today
+        if period_name == last_week_label:
+            end = today - timedelta(days=today.weekday())
+            return end - timedelta(days=6), end
         if period_name == "Last 30 days": return today - timedelta(days=30), today
         if period_name == "Last 90 days": return today - timedelta(days=90), today
         if period_name == "Last month":
@@ -355,7 +362,7 @@ def date_filters(key: str = "global") -> tuple[date, date, date, date, str]:
     with c1:
         period_args = {"label": f"Time period (**{preview_start:%b %d, %Y} – {preview_end:%b %d, %Y}**)", "options": period_options, "key": period_key}
         if period_key not in st.session_state:
-            period_args["index"] = 4
+            period_args["index"] = period_options.index("Last 30 days")
         period = st.selectbox(**period_args)
         if period == "Custom":
             if date_key not in st.session_state:

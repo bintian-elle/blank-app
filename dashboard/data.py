@@ -177,14 +177,24 @@ def _fetch_reports(api_key: str, revision: str, start: date, end: date, previous
     client, window = KlaviyoClient(api_key, revision), DateWindow(start, end)
     group_campaign = ["campaign_message_id", "campaign_id", "campaign_message_name", "send_channel", "variation", "variation_name"]
     group_flow = ["flow_message_id", "flow_id", "flow_name", "send_channel"]
-    campaigns = client.reporting_values("campaign-values-report", window, order_id, REPORT_STATS, group_campaign, timezone_name)
-    flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, group_flow, timezone_name)
-    previous_campaigns: list[dict] = []
-    previous_flows: list[dict] = []
-    if compare:
-        previous_window = DateWindow(previous_start, previous_end)
-        previous_campaigns = client.reporting_values("campaign-values-report", previous_window, order_id, REPORT_STATS, group_campaign, timezone_name)
-        previous_flows = client.reporting_values("flow-values-report", previous_window, order_id, REPORT_STATS, group_flow, timezone_name)
+    previous_window = DateWindow(previous_start, previous_end)
+
+    # Campaign and Flow reports have independent endpoint quotas, so fetch the
+    # two report types in parallel. Requests to the same endpoint remain
+    # sequential and spaced to respect Klaviyo's 1 request/second burst limit.
+    def fetch_report_type(report_type: str, groupings: list[str]) -> tuple[list[dict], list[dict]]:
+        current_rows = client.reporting_values(report_type, window, order_id, REPORT_STATS, groupings, timezone_name)
+        if not compare:
+            return current_rows, []
+        time.sleep(1.05)
+        previous_rows = client.reporting_values(report_type, previous_window, order_id, REPORT_STATS, groupings, timezone_name)
+        return current_rows, previous_rows
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        campaign_future = executor.submit(fetch_report_type, "campaign-values-report", group_campaign)
+        flow_future = executor.submit(fetch_report_type, "flow-values-report", group_flow)
+        campaigns, previous_campaigns = campaign_future.result()
+        flows, previous_flows = flow_future.result()
     return {"campaigns": campaigns, "flows": flows, "previous_campaigns": previous_campaigns, "previous_flows": previous_flows}
 
 
@@ -294,14 +304,11 @@ def load_channel_revenue(api_key: str, revision: str, start: date, end: date, or
     for name, metric_id in zip(activity_names, activity_metric_ids):
         if not metric_id:
             continue
-        _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, ["count"], "day", timezone_name))
-        activity_totals[name] = sum(float(value or 0) for value in metric_values.get("count", []))
+        measurement = "unique" if "unsubscribers" in name else "count"
+        _, metric_values = values_from_aggregate(client.aggregate(metric_id, window, [measurement], "day", timezone_name))
+        activity_totals[name] = sum(float(value or 0) for value in metric_values.get(measurement, []))
     email_health = report_totals(campaigns + flows, "email")
     sms_health = report_totals(campaigns + flows, "sms")
-    # Match Klaviyo message-performance reporting rather than raw consent-event
-    # counts for unsubscribe comparisons.
-    activity_totals["email_unsubscribers"] = load_attributed_email_unsubscribers(api_key, revision, start, end, activity_metric_ids[2] if len(activity_metric_ids) > 2 else "", _report_message_ids(campaigns, flows), timezone_name)
-    activity_totals["sms_unsubscribers"] = sms_health["unsubscribe_uniques"]
     return {"email": email, "sms": sms, "edm": email + sms, "flow": flow, "email_flow": email_flow, "email_campaign": email_campaign, "recipients": recipients, "flows": flows, "email_health": email_health, **activity_totals}
 
 
@@ -477,12 +484,11 @@ def load_dashboard(api_key: str, revision: str, start: date, end: date, previous
             campaign_channels, flow_items = _reporting_metadata_keys(reports)
             reports.update(load_reporting_metadata(api_key, revision, timezone_name, campaign_channels, flow_items))
             reports["account_timezone"] = timezone_name
-            email_unsubscribe_metric_id = current["metric_ids"].get("Unsubscribed from Email Marketing", "")
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                current_unsubs = executor.submit(load_attributed_email_unsubscribers, api_key, revision, start, end, email_unsubscribe_metric_id, _report_message_ids(reports["campaigns"], reports["flows"]), timezone_name)
-                previous_unsubs = executor.submit(load_attributed_email_unsubscribers, api_key, revision, previous_start, previous_end, email_unsubscribe_metric_id, _report_message_ids(reports["previous_campaigns"], reports["previous_flows"]), timezone_name) if compare else None
-                reports["email_unsubscribe_uniques"] = current_unsubs.result()
-                reports["previous_email_unsubscribe_uniques"] = previous_unsubs.result() if previous_unsubs else 0
+            # These native consent metrics are already part of the reusable
+            # daily aggregate cache. Summing their per-day unique values matches
+            # the selected Klaviyo date buckets without downloading every event.
+            reports["email_unsubscribe_uniques"] = _total(current.get("Unsubscribed from Email Marketing", {}).get("values", {}), "unique")
+            reports["previous_email_unsubscribe_uniques"] = _total(previous.get("Unsubscribed from Email Marketing", {}).get("values", {}), "unique") if compare else 0
         return current, previous, reports
     except KlaviyoError as exc:
         st.error(f"Klaviyo data could not be loaded: {exc}")
