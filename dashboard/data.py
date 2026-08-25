@@ -281,6 +281,7 @@ def load_channel_revenue(api_key: str, revision: str, start: date, end: date, or
     flows = client.reporting_values("flow-values-report", window, order_id, REPORT_STATS, flow_groupings, timezone_name)
     email_campaign = report_totals(campaigns, "email")["conversion_value"]
     email_flow = report_totals(flows, "email")["conversion_value"]
+    flow = report_totals(flows)["conversion_value"]
     email = email_campaign + email_flow
     sms = report_totals(campaigns + flows, "sms")["conversion_value"]
     recipients = 0.0
@@ -301,7 +302,7 @@ def load_channel_revenue(api_key: str, revision: str, start: date, end: date, or
     # counts for unsubscribe comparisons.
     activity_totals["email_unsubscribers"] = load_attributed_email_unsubscribers(api_key, revision, start, end, activity_metric_ids[2] if len(activity_metric_ids) > 2 else "", _report_message_ids(campaigns, flows), timezone_name)
     activity_totals["sms_unsubscribers"] = sms_health["unsubscribe_uniques"]
-    return {"email": email, "sms": sms, "edm": email + sms, "email_flow": email_flow, "email_campaign": email_campaign, "recipients": recipients, "flows": flows, "email_health": email_health, **activity_totals}
+    return {"email": email, "sms": sms, "edm": email + sms, "flow": flow, "email_flow": email_flow, "email_campaign": email_campaign, "recipients": recipients, "flows": flows, "email_health": email_health, **activity_totals}
 
 
 @st.cache_data(ttl=21600, show_spinner=False)

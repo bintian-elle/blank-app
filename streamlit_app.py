@@ -121,12 +121,12 @@ with summary:
     comparison_sentences = ""
     if mode != "No comparison":
         comparison_sentences = (
-            f' EDM revenue <b>{change_text(edm_revenue, previous_edm_revenue, fmt_money(edm_revenue))}</b>.'
+            f' Attributed EDM revenue <b>{change_text(edm_revenue, previous_edm_revenue, fmt_money(edm_revenue))}</b>.'
             f' Email recipients <b>{change_text(email_received, prev_email, fmt_num(email_received))}</b>, while text recipients <b>{change_text(text_sent, prev_text, fmt_num(text_sent))}</b>.'
             f' By channel, Email revenue <b>{change_text(email_all["conversion_value"], previous_email_all["conversion_value"], fmt_money(email_all["conversion_value"]))}</b> and SMS revenue <b>{change_text(sms_all["conversion_value"], previous_sms_all["conversion_value"], fmt_money(sms_all["conversion_value"]))}</b>.'
             f' By message type, Flows revenue <b>{change_text(flow_total["conversion_value"], previous_flow_total["conversion_value"], fmt_money(flow_total["conversion_value"]))}</b> and Campaigns revenue <b>{change_text(campaign_total["conversion_value"], previous_campaign_total["conversion_value"], fmt_money(campaign_total["conversion_value"]))}</b>.'
         )
-    st.markdown(f'<div class="summary-copy">From <b>{start:%b %d}</b> to <b>{end:%b %d, %Y}</b>, email and SMS marketing generated <b>{fmt_money(edm_revenue)}</b>, accounting for <b>{edm_share}</b> of total revenue. Email reached <b>{fmt_num(email_received)}</b> recipients and text reached <b>{fmt_num(text_sent)}</b> recipients.{comparison_sentences}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="summary-copy">From <b>{start:%b %d}</b> to <b>{end:%b %d, %Y}</b>, email and SMS marketing generated <b>{fmt_money(edm_revenue)}</b> in attributed revenue, accounting for <b>{edm_share}</b> of total revenue. Email reached <b>{fmt_num(email_received)}</b> recipients and text reached <b>{fmt_num(text_sent)}</b> recipients.{comparison_sentences}</div>', unsafe_allow_html=True)
 summary_items = [(r1, "TOTAL EDM REVENUE", fmt_money(edm_revenue), change(edm_revenue, previous_edm_revenue)), (r2, "EMAIL RECIPIENTS", fmt_num(email_received), change(email_received, prev_email)), (r3, "TEXT RECIPIENTS", fmt_num(text_sent), change(text_sent, prev_text)), (r4, "LARGEST CHANGE", largest_change_area, valid_changes.get(largest_change_area))]
 for col, label, value, delta in summary_items:
     with col:
@@ -157,8 +157,8 @@ if request_yoy:
             st.warning(f"Klaviyo rate limit reached. YoY can be retried in {retry_seconds} seconds.")
         else:
             st.warning(f"Previous Year data could not be loaded: {exc}")
-email_flow_revenue = report_totals(reports["flows"], "email")["conversion_value"]
-previous_email_flow_revenue = report_totals(reports["previous_flows"], "email")["conversion_value"]
+flow_revenue_total = flow_total["conversion_value"]
+previous_flow_revenue_total = previous_flow_total["conversion_value"]
 total_recipients = email_received + text_sent
 previous_total_recipients = prev_email + prev_text
 business_card_data = [
@@ -166,7 +166,7 @@ business_card_data = [
     ("SMS Revenue", fmt_money(sms_all["conversion_value"]), percent_change_text(sms_all["conversion_value"], previous_sms_all["conversion_value"]), f"{sms_all['conversion_value']/edm_revenue:.1%} of EDM revenue" if edm_revenue else "Share of EDM revenue —", yoy_change(sms_all["conversion_value"], "sms")),
     ("Total Recipients", fmt_num(total_recipients), percent_change_text(total_recipients, previous_total_recipients), "Email + text recipients", yoy_change(total_recipients, "recipients")),
     ("Email Revenue", fmt_money(email_all["conversion_value"]), percent_change_text(email_all["conversion_value"], previous_email_all["conversion_value"]), f"{email_all['conversion_value']/edm_revenue:.1%} of EDM revenue" if edm_revenue else "Share of EDM revenue —", yoy_change(email_all["conversion_value"], "email")),
-    ("Flows Revenue", fmt_money(email_flow_revenue), percent_change_text(email_flow_revenue, previous_email_flow_revenue), f"{email_flow_revenue/email_all['conversion_value']:.1%} of Email revenue" if email_all["conversion_value"] else "Share of Email revenue —", yoy_change(email_flow_revenue, "email_flow")),
+    ("Flows Revenue", fmt_money(flow_revenue_total), percent_change_text(flow_revenue_total, previous_flow_revenue_total), f"{flow_revenue_total/edm_revenue:.1%} of attributed EDM revenue" if edm_revenue else "Share of attributed EDM revenue —", yoy_change(flow_revenue_total, "flow")),
     ("Campaigns Revenue", fmt_money(email_campaign["conversion_value"]), percent_change_text(email_campaign["conversion_value"], previous_email_campaign["conversion_value"]), f"{email_campaign['conversion_value']/email_all['conversion_value']:.1%} of Email revenue" if email_all["conversion_value"] else "Share of Email revenue —", yoy_change(email_campaign["conversion_value"], "email_campaign")),
 ]
 for row_start in (0, 3):
@@ -279,25 +279,25 @@ email_df, email_visible_count, email_campaign_count = paginated_campaigns(email_
 sms_df, sms_visible_count, sms_campaign_count = paginated_campaigns(sms_campaign_df, "sms")
 
 
-def flow_revenue(rows: list[dict], aliases: tuple[str, ...], channel: str) -> float:
+def flow_revenue(rows: list[dict], aliases: tuple[str, ...], channel: str | None) -> float:
     total = 0.0
     for row in rows:
         group = row.get("groupings", {})
         name = str(group.get("flow_name") or reports["flow_names"].get(str(group.get("flow_id") or ""), "")).lower()
         send_channel = str(group.get("send_channel") or "").strip().lower()
-        if send_channel == channel and any(alias in name for alias in aliases):
+        if (channel is None or send_channel == channel) and any(alias in name for alias in aliases):
             total += float(row.get("statistics", {}).get("conversion_value") or 0)
     return total
 
 
-def select_flow(label: str, aliases: tuple[str, ...], channel: str = "email") -> dict:
+def select_flow(label: str, aliases: tuple[str, ...], channel: str | None = "email") -> dict:
     current_value = flow_revenue(reports["flows"], aliases, channel)
     previous_value = flow_revenue(reports["previous_flows"], aliases, channel)
     yoy_value = flow_revenue(yoy_revenue.get("flows", []), aliases, channel) if yoy_revenue else None
     return {"Flow Name": label, "Revenue": current_value, "Previous Revenue": previous_value, "YoY Revenue": yoy_value}
 
 
-featured_flows = [select_flow("Welcome Flow", ("welcome",), "email"), select_flow("SMS Welcome Flow", ("welcome",), "sms"), select_flow("Abandoned Checkout Flow", ("abandoned checkout", "checkout abandon"), "email"), select_flow("Abandoned Cart Flow", ("abandoned cart", "cart abandon"), "email"), select_flow("Post Purchase Flow", ("post purchase", "post-purchase", "instructions", "reminders"), "email")]
+featured_flows = [select_flow("Welcome Flow", ("welcome",), None), select_flow("SMS Welcome Flow", ("welcome",), "sms"), select_flow("Abandoned Checkout Flow", ("abandoned checkout", "checkout abandon"), "email"), select_flow("Abandoned Cart Flow", ("abandoned cart", "cart abandon"), "email"), select_flow("Post Purchase Flow", ("post purchase", "post-purchase", "instructions", "reminders"), "email")]
 featured_flow_df = pd.DataFrame(featured_flows)
 
 
